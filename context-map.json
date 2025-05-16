@@ -1,0 +1,16 @@
+{
+  "handlers": [
+    "handlers/dynamic_handler_SANEAGO.py",
+    "handlers/dynamic_handler_CAGECE.py",
+    "handlers/dynamic_handler_CESAN.py",
+    "handlers/dynamic_handler_SANEPAR.py",
+    "handlers/dynamic_handler_copasa.py",
+    "handlers/dynamic_handler_compesa_acompanhamento.py",
+    "handlers/dynamic_handler_compesa_aviso.py",
+    "handlers/handler_cesan.py"
+  ],
+  "analyzers": [
+    "analyzers/edital_analyzer.py"
+  ],
+  "utils": []
+}
