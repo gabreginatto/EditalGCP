@@ -11,161 +11,133 @@ from pathlib import Path
 from datetime import datetime
 from playwright.sync_api import sync_playwright, expect, TimeoutError as PlaywrightTimeoutError
 
+# Global CONFIG dictionary - to be populated by _get_dynamic_config
+CONFIG = {}
+logger = logging.getLogger("CAGECEHandler") # Define logger globally for helper functions
+
 # --- Configuration ---
-# Define paths
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-base_download_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-downloads_dir = Path(base_download_dir) / "downloads"
-log_dir = os.path.join(base_download_dir, "logs")
-os.makedirs(log_dir, exist_ok=True)
-
-# Define keywords to search for
-KEYWORDS = ["tubo", "polietileno", "PEAD", "polimero", "PAM", "hidrômetro", "medidor"]
-
-# Define default timeout for details page processing (in seconds)
-DETAILS_PAGE_TIMEOUT = 25
-
-# Group configuration variables for better organization
-CONFIG = {
-    "target_url": "https://s2gpr.sefaz.ce.gov.br/licita-web/paginas/licita/PublicacaoList.seam",
-    "downloads_dir": downloads_dir, # Base output directory
-    "pdfs_dir": downloads_dir / "pdfs", # Directory for PDF files
-    "archives_dir": downloads_dir / "archives", # Directory for final ZIP archives
-    "temp_dir": downloads_dir / "temp", # Directory for temporary files per process
-    "debug_dir": downloads_dir / "debug", # Debugging outputs
-    "logs_dir": downloads_dir / "logs", # Directory for log files
-    "screenshots_dir": downloads_dir / "debug" / "screenshots", # Screenshots directory
-    "processed_log_file": downloads_dir / "processed_processos.txt", # File to track processed IDs (text format)
-    "processed_ids_json": downloads_dir / "processed_CAGECE.json", # File to track processed IDs (JSON format)
-    "take_screenshots": True,  # Enable taking screenshots
-    "headless_mode": False, # Set True for production/headless execution
-    "search_params": {
-        "organization_label": "COMPANHIA DE AGUA E ESGOTO DO CEARA",
-        "acquisition_nature_label": "EQUIPAMENTOS E MATERIAL PERMANENTE",
-        "start_date": {
-            "day": 1,
-            "month": 0,  # 0-based month (0 = January)
-            "year": 2025
+def _get_dynamic_config(base_output_dir: str, company_id: str, search_keyword_override: str = ""):
+    """Generates the dynamic configuration dictionary based on the output directory."""
+    downloads_dir = Path(base_output_dir) # Base output directory is the root for this handler's run
+    
+    current_config = {
+        "target_url": "https://s2gpr.sefaz.ce.gov.br/licita-web/paginas/licita/PublicacaoList.seam",
+        "base_output_dir": str(downloads_dir), # Store the base output_dir
+        "pdfs_dir": str(downloads_dir / "pdfs"),
+        "archives_dir": str(downloads_dir / "archives"),
+        "temp_dir": str(downloads_dir / "temp"),
+        "debug_dir": str(downloads_dir / "debug"),
+        "logs_dir": str(downloads_dir / "logs"),
+        "screenshots_dir": str(downloads_dir / "debug" / "screenshots"),
+        "processed_ids_json": str(downloads_dir / f"processed_{company_id}.json"),
+        "take_screenshots": True,
+        "headless_mode": False, # Set True for production/headless execution (or pass as param)
+        "search_params": {
+            "organization_label": "COMPANHIA DE AGUA E ESGOTO DO CEARA",
+            "acquisition_nature_label": "EQUIPAMENTOS E MATERIAL PERMANENTE",
+            "start_date": {
+                "day": 1,
+                "month": 0,  # 0-based month (0 = January)
+                "year": datetime.now().year # Default to current year, can be overridden
+            },
+            "object_keyword": search_keyword_override # This will be set per keyword iteration
         },
-        "object_keyword": "tubo"
-    },
-    "selectors": {
-        # Main Form & Search Fields
-        "main_form": "#formularioDeCrud",
-        "organization_dropdown": "#formularioDeCrud\:promotorCotacaoDecoration\:promotorLicitacao",
-        "acquisition_nature_dropdown": "#formularioDeCrud\:naturezaAquisicaoDecoration\:naturezaAquisicao",
-        "object_input": "#formularioDeCrud\:objetoContratacaoDecoration\:objetoContratacao",
-        "object_input_fallback": '#formularioDeCrud textarea', # Fallback if input fails
-        "search_button": '#formularioDeCrud\:pesquisar',
-        "search_button_fallback": 'input[value="Pesquisar"]',
+        "selectors": {
+            # Main Form & Search Fields
+            "main_form": "#formularioDeCrud",
+            "organization_dropdown": "#formularioDeCrud\:promotorCotacaoDecoration\:promotorLicitacao",
+            "acquisition_nature_dropdown": "#formularioDeCrud\:naturezaAquisicaoDecoration\:naturezaAquisicao",
+            "object_input": "#formularioDeCrud\:objetoContratacaoDecoration\:objetoContratacao",
+            "object_input_fallback": '#formularioDeCrud textarea',
+            "search_button": '#formularioDeCrud\:pesquisar',
+            "search_button_fallback": 'input[value="Pesquisar"]',
+            "start_date_input": "#formularioDeCrud\:inicioAcolhimentoDecoration\:inicioAcolhimentoPropostasInputDate",
+            "start_date_button": "#formularioDeCrud\:inicioAcolhimentoDecoration\:inicioAcolhimentoPropostasPopupButton",
+            "calendar_popup": 'table.rich-calendar-popup[style*="z-index"]',
+            "calendar_header": 'td.rich-calendar-header',
+            "prev_year_button": 'div[onclick*="prevYear"]',
+            "next_year_button": 'div[onclick*="nextYear"]',
+            "prev_month_button": 'div[onclick*="prevMonth"]',
+            "next_month_button": 'div[onclick*="nextMonth"]',
+            "calendar_day_cell": 'td.rich-calendar-cell:not(.rich-calendar-boundary-dates)',
+            "calendar_apply_button": 'div.rich-calendar-tool-btn:has-text("Apply")',
+            "results_table": '#formularioDeCrud\:pagedDataTable',
+            "results_row_radio_img_generic": "table#formularioDeCrud\:pagedDataTable tbody tr td.primeiraColuna img[style*='cursor:pointer']",
+            "visualize_button": 'input[value="Visualizar"]',
+            "visualize_button_enabled": 'input[value="Visualizar"]:not([disabled])',
+            "doc_tables": [
+                '#formularioDeCrud\:docTermoListAction',
+                '#formularioDeCrud\:arquivoProcessoTable',
+                'table[id*="docTermoListAction"]',
+                'table[id*="arquivoProcessoTable"]',
+                'div#formularioDeCrud\:docTermoParticipacao table',
+                'div#formularioDeCrud\:documentos table',
+                'table[id*="formularioDeCrud"][id*="List"]',
+                'div.tabelas table'
+            ],
+            "doc_download_button_primary_termo": '#formularioDeCrud\\:downloadButtonInf',
+            "doc_download_button_primary_arquivo": 'div#formularioDeCrud\\:download input[value="Baixar"]',
+            "doc_download_buttons_fallback": [
+                'input[id="formularioDeCrud:downloadButtonInf"]', 'input[value="Download"]',
+                'input[type="submit"][value="Download"]', 'input[value="Baixar"]',
+                'input[type="submit"][value="Baixar"]', 'input[name="formularioDeCrud:j_id330"]',
+                'div#formularioDeCrud\\:download input', 'div#formularioDeCrud\\:grupoButtonsInf input',
+                'div.actionButtons input[value="Download"]', 'div.actionButtons input[value="Baixar"]',
+                'div.actionButtons input[type="submit"]', 'input[id*="download"][type="button"]',
+                'input[id*="download"][type="submit"]'
+            ],
+            "return_button_selectors": [
+                 'input[id="formularioDeCrud:pesquisar"]', 'input[value="Retornar para Pesquisa"]',
+                 'input.retornarPesquisa', 'input.sec.retornarPesquisa', '#formularioDeCrud\\:pesquisar'
+            ],
+            "doc_name_arquivo": '#{base_id}:{index}:j_id324',
+            "doc_name_termo": 'id={base_id}:{index}:docTermo',
+            "doc_name_fallback_arquivo": '{table_selector} tbody tr:nth-child({row_num}) td:nth-child(2)',
+            "doc_name_fallback_termo": '{table_selector} tbody tr:nth-child({row_num}) td:nth-child(2) span',
+            "doc_radio_cell_arquivo": 'td[id="{base_id}:{index}:j_id321"]',
+            "doc_radio_cell_termo": 'td[id="{base_id}:{index}:j_id203"]',
+            "doc_radio_fallback_img": '{table_selector} tbody tr:nth-child({row_num}) td:nth-child(1) img',
+            "doc_radio_fallback_span_img": '{table_selector} tbody tr:nth-child({row_num}) td:nth-child(1) span img'
+        },
+        "timeouts": { 
+            "navigation": 90000, "default_page": 60000, "default_expect": 30000,
+            "element_wait": 15000, "search_results": 30000, "button_enable": 15000,
+            "download": 60000, "details_load": 20000, "network_idle": 20000,
+            "short_pause": 1500, "calendar_popup": 7000, "calendar_day_click": 3000,
+            "calendar_apply_click": 3000, "radio_click_wait": 2000,
+            "details_render_wait": 7000, "return_navigation": 20000,
+            "return_element_wait": 15000
+        },
+        "calendar_months_pt": [
+            'janeiro', 'fevereiro', 'março', 'abril', 'maio', 'junho',
+            'julho', 'agosto', 'setembro', 'outubro', 'novembro', 'dezembro'
+        ]
+    }
+    return current_config
 
-        # Calendar
-        "start_date_input": "#formularioDeCrud\:inicioAcolhimentoDecoration\:inicioAcolhimentoPropostasInputDate",
-        "start_date_button": "#formularioDeCrud\:inicioAcolhimentoDecoration\:inicioAcolhimentoPropostasPopupButton",
-        "calendar_popup": 'table.rich-calendar-popup[style*="z-index"]', # Visible calendar
-        "calendar_header": 'td.rich-calendar-header',
-        "prev_year_button": 'div[onclick*="prevYear"]',
-        "next_year_button": 'div[onclick*="nextYear"]',
-        "prev_month_button": 'div[onclick*="prevMonth"]',
-        "next_month_button": 'div[onclick*="nextMonth"]',
-        "calendar_day_cell": 'td.rich-calendar-cell:not(.rich-calendar-boundary-dates)',
-        "calendar_apply_button": 'div.rich-calendar-tool-btn:has-text("Apply")',
+# --- Logging Setup Function ---
+def setup_logging(log_dir_path: str, company_id: str):
+    os.makedirs(log_dir_path, exist_ok=True)
+    log_file = f"dynamic_handler_{company_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_path = os.path.join(log_dir_path, log_file)
 
-        # Search Results Table & Rows
-        "results_table": '#formularioDeCrud\:pagedDataTable',
-        "results_row_radio_img_exact": "img#formularioDeCrud\:pagedDataTable\:375975\:uncheckRadio", # Specific target
-        "results_row_radio_img_generic": "table#formularioDeCrud\:pagedDataTable tbody tr td.primeiraColuna img[style*='cursor:pointer']", # Generic target
-        "visualize_button": 'input[value="Visualizar"]', # General visualize button
-        "visualize_button_enabled": 'input[value="Visualizar"]:not([disabled])', # Enabled visualize button
+    # Remove existing handlers from the root logger if any
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+    # Remove existing handlers from CAGECEHandler logger
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
 
-        # Details Page & Document Download
-        "doc_tables": [ # List of potential table selectors
-            '#formularioDeCrud\:docTermoListAction',
-            '#formularioDeCrud\:arquivoProcessoTable',
-            'table[id*="docTermoListAction"]',
-            'table[id*="arquivoProcessoTable"]',
-            'div#formularioDeCrud\:docTermoParticipacao table',
-            'div#formularioDeCrud\:documentos table',
-            'table[id*="formularioDeCrud"][id*="List"]',
-            'div.tabelas table'
-        ],
-        "doc_download_button_primary_termo": '#formularioDeCrud\\:downloadButtonInf', # Primary for 'docTermo' table
-        "doc_download_button_primary_arquivo": 'div#formularioDeCrud\\:download input[value="Baixar"]', # Primary for 'arquivoProcesso' table
-        "doc_download_buttons_fallback": [ # Fallback selectors
-            'input[id="formularioDeCrud:downloadButtonInf"]',
-            'input[value="Download"]',
-            'input[type="submit"][value="Download"]',
-            'input[value="Baixar"]',
-            'input[type="submit"][value="Baixar"]',
-            'input[name="formularioDeCrud:j_id330"]',
-            'div#formularioDeCrud\\:download input',
-            'div#formularioDeCrud\\:grupoButtonsInf input',
-            'div.actionButtons input[value="Download"]',
-            'div.actionButtons input[value="Baixar"]',
-            'div.actionButtons input[type="submit"]',
-            'input[id*="download"][type="button"]',
-            'input[id*="download"][type="submit"]',
-        ],
-        "return_button_selectors": [ # Selectors for the return button
-             'input[id="formularioDeCrud:pesquisar"]', # This ID is reused, check context
-             'input[value="Retornar para Pesquisa"]',
-             'input.retornarPesquisa',
-             'input.sec.retornarPesquisa',
-             '#formularioDeCrud\\:pesquisar'
-        ],
-        # Selectors for document names and radio buttons within tables (using format strings)
-        "doc_name_arquivo": '#{base_id}:{index}:j_id324', # For arquivoProcessoTable
-        "doc_name_termo": 'id={base_id}:{index}:docTermo', # For docTermoListAction
-        "doc_name_fallback_arquivo": '{table_selector} tbody tr:nth-child({row_num}) td:nth-child(2)',
-        "doc_name_fallback_termo": '{table_selector} tbody tr:nth-child({row_num}) td:nth-child(2) span',
-        "doc_radio_cell_arquivo": 'td[id="{base_id}:{index}:j_id321"]',
-        "doc_radio_cell_termo": 'td[id="{base_id}:{index}:j_id203"]',
-        "doc_radio_fallback_img": '{table_selector} tbody tr:nth-child({row_num}) td:nth-child(1) img',
-        "doc_radio_fallback_span_img": '{table_selector} tbody tr:nth-child({row_num}) td:nth-child(1) span img',
-    },
-    "timeouts": { # Timeouts in milliseconds
-        "navigation": 90000,
-        "default_page": 60000, # Default timeout for page actions
-        "default_expect": 30000, # Default for expect assertions
-        "element_wait": 15000,
-        "search_results": 30000,
-        "button_enable": 15000,
-        "download": 60000, # Increased download timeout
-        "details_load": 20000, # Increased details page load timeout
-        "network_idle": 20000, # Timeout for waiting for network idle
-        "short_pause": 1500, # General short pause after actions
-        "calendar_popup": 7000,
-        "calendar_day_click": 3000,
-        "calendar_apply_click": 3000,
-        "radio_click_wait": 2000, # Wait after clicking a radio button
-        "details_render_wait": 7000, # Extra wait for details page rendering
-        "return_navigation": 20000,
-        "return_element_wait": 15000,
-    },
-    "calendar_months_pt": [ # Portuguese months for parsing
-        'janeiro', 'fevereiro', 'março', 'abril', 'maio', 'junho',
-        'julho', 'agosto', 'setembro', 'outubro', 'novembro', 'dezembro'
-    ]
-}
-
-# --- Logging Setup ---
-# Configure logging with file and console output
-script_dir = os.path.dirname(os.path.abspath(__file__))
-log_dir = os.path.join(base_download_dir, "logs")
-os.makedirs(log_dir, exist_ok=True)
-
-log_file = f"dynamic_handler_cagece_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-log_path = os.path.join(log_dir, log_file)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - [%(name)s:%(lineno)d] - %(message)s',
-    handlers=[
-        logging.FileHandler(log_path, encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger("CAGECEHandler")
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - [%(name)s:%(lineno)d] - %(message)s',
+        handlers=[
+            logging.FileHandler(log_path, encoding='utf-8'),
+            logging.StreamHandler(sys.stdout) # Keep console output
+        ]
+    )
+    logger.info(f"Logging initialized. Log file: {log_path}")
+    return log_path
 
 # --- Helper Functions ---
 
@@ -797,8 +769,8 @@ def process_details_page(page, process_id):
                     # Check for timeout before processing each row
                     current_time = time.time()
                     time_since_activity = current_time - last_activity_time
-                    if time_since_activity > DETAILS_PAGE_TIMEOUT:
-                        logger.warning(f"Timeout detected! No activity for {time_since_activity:.1f} seconds (threshold: {DETAILS_PAGE_TIMEOUT}s)")
+                    if time_since_activity > 25:
+                        logger.warning(f"Timeout detected! No activity for {time_since_activity:.1f} seconds (threshold: 25s)")
                         break
                         
                     # Try to process row
@@ -823,8 +795,8 @@ def process_details_page(page, process_id):
     # Check for timeout before returning to search results
     current_time = time.time()
     time_since_activity = current_time - last_activity_time
-    if time_since_activity > DETAILS_PAGE_TIMEOUT:
-        logger.warning(f"Timeout detected before return! No activity for {time_since_activity:.1f} seconds (threshold: {DETAILS_PAGE_TIMEOUT}s)")
+    if time_since_activity > 25:
+        logger.warning(f"Timeout detected before return! No activity for {time_since_activity:.1f} seconds (threshold: 25s)")
         return False
     
     # Return to search results
@@ -835,8 +807,8 @@ def process_details_page(page, process_id):
     # Final timeout check
     current_time = time.time()
     time_since_activity = current_time - last_activity_time
-    if time_since_activity > DETAILS_PAGE_TIMEOUT:
-        logger.warning(f"Timeout detected after return attempt! No activity for {time_since_activity:.1f} seconds (threshold: {DETAILS_PAGE_TIMEOUT}s)")
+    if time_since_activity > 25:
+        logger.warning(f"Timeout detected after return attempt! No activity for {time_since_activity:.1f} seconds (threshold: 25s)")
         return False
     
     # Return True only if both processing and navigation were successful
@@ -1257,203 +1229,151 @@ def process_search_results(page, processed_ids=None):
     logger.info(f"Finished processing search results. Processed {processed_row_count}/{total_results_count} rows.")
 
 
-# --- Main Script Execution ---
-def process_keyword(keyword):
-    """Process a single keyword search."""
-    logging.info(f"\n\n--- PROCESSING KEYWORD: {keyword} ---\n")
-    
-    # Reload processed IDs before processing each keyword
-    processed_ids = load_processed_ids_json()
-    logging.info(f"Reloaded {len(processed_ids)} processed IDs before processing keyword '{keyword}'")
-    
-    # Handle PAM keyword to match exactly as a whole word
-    search_keyword = keyword
-    if keyword == "PAM":
-        # Use space before and after to ensure exact match
-        search_keyword = f" {keyword} "
-        logging.info(f"Modified search keyword '{keyword}' to use spaces around: {search_keyword}")
-    
-    # Save the keyword to the config
-    CONFIG["search_params"]["object_keyword"] = search_keyword
-    
-    with sync_playwright() as p:
-        browser = None
-        context = None
-        page = None
-        try:
-            logging.info("Launching browser...")
-            browser = p.chromium.launch(
-                headless=CONFIG["headless_mode"],
-                args=[
-                    '--start-maximized',
-                    '--disable-web-security', # May be needed for certain interactions/downloads
-                    '--disable-features=IsolateOrigins,site-per-process', # Stability flags
-                    '--disable-site-isolation-trials'
-                ]
-            )
-            logging.info("Browser launched.")
+# --- Main Script Execution Logic (called by run_handler) ---
+def _process_single_keyword(page, keyword: str, current_config: dict):
+    """Processes a single keyword. Adapts original process_keyword logic."""
+    logger.info(f"Processing CAGECE with keyword: {keyword} into {current_config['base_output_dir']}")
+    # Update the config for this specific keyword run if needed (e.g. object_keyword)
+    # The global CONFIG is already updated by run_handler with the base paths.
+    # current_config here is the one specific to this keyword's iteration.
+    current_config['search_params']['object_keyword'] = keyword
 
+    # This is where the main playwright logic from the original process_keyword would go.
+    # For now, this function needs to be filled with the actual scraping logic.
+    # It should return a list of tender dicts found for this keyword.
+    # Example of what needs to be adapted from original process_keyword:
+    # page.goto(current_config["target_url"], timeout=current_config["timeouts"]["navigation"]) 
+    # ... search form filling ...
+    # results_data = process_search_results(page, processed_ids)
+    # return results_data (which needs to be a list of dicts)
+
+    # Placeholder return, actual implementation requires refactoring process_search_results
+    # and its callers to collect and return structured data.
+    
+    # Simplified flow for now, assuming process_search_results is refactored
+    # to return the list of tender dictionaries.
+    all_tender_data_for_keyword = []
+    try:
+        page.goto(current_config["target_url"], timeout=current_config["timeouts"]["navigation"])
+        logger.info(f"Navigated to {current_config['target_url']}")
+        safe_screenshot(page, f"{keyword}_0_initial_page")
+
+        # Fill organization
+        select_dropdown_option_by_label(page, current_config["selectors"]["organization_dropdown"], current_config["search_params"]["organization_label"])
+        logger.info(f"Selected organization: {current_config['search_params']['organization_label']}")
+        page.wait_for_timeout(current_config["timeouts"]["short_pause"]) # Allow for any dynamic loading
+        safe_screenshot(page, f"{keyword}_1_organization_selected")
+
+        # Fill acquisition nature
+        select_dropdown_option_by_label(page, current_config["selectors"]["acquisition_nature_dropdown"], current_config["search_params"]["acquisition_nature_label"])
+        logger.info(f"Selected acquisition nature: {current_config['search_params']['acquisition_nature_label']}")
+        page.wait_for_timeout(current_config["timeouts"]["short_pause"])
+        safe_screenshot(page, f"{keyword}_2_acquisition_nature_selected")
+
+        # Fill object (keyword)
+        try:
+            page.locator(current_config["selectors"]["object_input"]).fill(keyword)
+        except PlaywrightTimeoutError:
+            logger.warning("Primary object input timed out, trying fallback.")
+            page.locator(current_config["selectors"]["object_input_fallback"]).fill(keyword)
+        logger.info(f"Filled object with keyword: {keyword}")
+        safe_screenshot(page, f"{keyword}_3_object_filled")
+
+        # Select Date (e.g., from Jan 1st of current year)
+        start_date_params = current_config["search_params"]["start_date"]
+        page.locator(current_config["selectors"]["start_date_button"]).click()
+        select_date_in_calendar(page, start_date_params["day"], start_date_params["month"], start_date_params["year"])
+        logger.info(f"Selected start date: {start_date_params['day']}/{start_date_params['month']+1}/{start_date_params['year']}")
+        safe_screenshot(page, f"{keyword}_4_date_selected")
+        page.wait_for_timeout(current_config["timeouts"]["short_pause"])
+
+        # Click search
+        find_and_click_element(page, [current_config["selectors"]["search_button"], current_config["selectors"]["search_button_fallback"]], "Search Button")
+        logger.info("Clicked search button.")
+        page.wait_for_load_state("networkidle", timeout=current_config["timeouts"]["search_results"])
+        safe_screenshot(page, f"{keyword}_5_search_results")
+
+        processed_ids = load_processed_ids_json() # Uses CONFIG.processed_ids_json
+        # The process_search_results function needs to be refactored to return list of dicts
+        # and to use current_config correctly
+        keyword_tender_data = process_search_results(page, processed_ids=processed_ids, current_keyword_config=current_config) 
+        all_tender_data_for_keyword.extend(keyword_tender_data)
+        logger.info(f"Found {len(keyword_tender_data)} new tenders for keyword '{keyword}'.")
+
+    except PlaywrightTimeoutError as pte:
+        logger.error(f"Playwright timeout during processing for keyword '{keyword}': {pte}")
+        safe_screenshot(page, f"{keyword}_playwright_timeout_error")
+    except Exception as e:
+        logger.error(f"Unexpected error during processing for keyword '{keyword}': {e}", exc_info=True)
+        safe_screenshot(page, f"{keyword}_unexpected_error")
+    
+    return all_tender_data_for_keyword
+
+def run_handler(company_id: str, output_dir: str, keywords: list, notion_database_id: str = None, headless_mode: bool = True):
+    """Main entry point for the CAGECE handler, called by the dispatcher."""
+    global CONFIG # Allow run_handler to set the global CONFIG for helper functions
+    
+    # Initialize CONFIG with the base output directory for this run. Paths inside CONFIG will be derived from this.
+    # The first keyword is used to initialize object_keyword, but it will be overridden per iteration.
+    CONFIG = _get_dynamic_config(output_dir, company_id, search_keyword_override=keywords[0] if keywords else "")
+    
+    setup_logging(CONFIG['logs_dir'], company_id)
+    logger.info(f"run_handler for CAGECE (Company ID: {company_id}) initiated. Output Dir: {output_dir}")
+    logger.info(f"Using keywords: {keywords}")
+    if not keywords:
+        logger.warning("No keywords provided to CAGECE handler. Exiting.")
+        return []
+
+    setup_output_dirs() # Ensure all output directories based on new CONFIG exist
+
+    all_processed_tenders = []
+
+    with sync_playwright() as p:
+        try:
+            browser = p.chromium.launch(headless=headless_mode) # Use headless_mode from params
             context = browser.new_context(
-                no_viewport=True, # Use browser's full window size when maximized
-                ignore_https_errors=True,
                 accept_downloads=True,
-                # Set default timeouts for the context
-                # viewport={'width': 1920, 'height': 1080}, # Set viewport if not using maximized/no_viewport
-                java_script_enabled=True,
-                bypass_csp=True # May help with content loading issues
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
             )
             context.set_default_timeout(CONFIG["timeouts"]["default_page"])
-            context.set_default_navigation_timeout(CONFIG["timeouts"]["navigation"])
-            logging.info("Browser context created.")
-
             page = context.new_page()
-            logging.info(f"Navigating to: {CONFIG['target_url']}")
-            page.goto(CONFIG["target_url"], wait_until="domcontentloaded") # Wait for DOM first
-            logging.info("Initial page load (DOM content loaded). Waiting for network idle...")
-            # Add a wait for network idle after initial load
-            page.wait_for_load_state('networkidle', timeout=CONFIG["timeouts"]["network_idle"])
-            logging.info("Page navigation complete and network idle.")
-            safe_screenshot(page, f"page_loaded_{keyword}")
 
-            # --- Wait for Form ---
-            logging.info("Waiting for search form elements to be ready...")
-            expect(page.locator(CONFIG["selectors"]["main_form"])).to_be_visible(timeout=CONFIG["timeouts"]["element_wait"])
-            expect(page.locator(CONFIG["selectors"]["organization_dropdown"])).to_be_enabled(timeout=CONFIG["timeouts"]["element_wait"])
-            logging.info("Search form is ready.")
-
-            # --- Fill Search Form ---
-            logging.info("Filling search form...")
-            search_params = CONFIG["search_params"]
-            selectors = CONFIG["selectors"]
-            timeouts = CONFIG["timeouts"]
-
-            # 1. Organization
-            select_dropdown_option_by_label(page, selectors["organization_dropdown"], search_params["organization_label"])
-
-            # 2. Acquisition Nature
-            select_dropdown_option_by_label(page, selectors["acquisition_nature_dropdown"], search_params["acquisition_nature_label"])
-
-            # 3. Start Date Calendar
-            logging.info("Setting Start Date using calendar...")
-            date_params = search_params['start_date']
-            calendar_button = page.locator(selectors["start_date_button"])
-            if calendar_button.count() > 0:
-                 calendar_button.click()
-                 page.wait_for_timeout(500) # Brief pause for calendar to open
-                 select_date_in_calendar(
-                     page,
-                     day=date_params['day'],
-                     target_month_index=date_params['month'],
-                     target_year=date_params['year']
-                 )
-            else:
-                 logging.warning("Start date calendar button not found. Skipping date selection.")
-
-
-            # 4. Object Keyword
-            logging.info(f"Entering Object Keyword: {search_params['object_keyword']}")
-            object_input = page.locator(selectors["object_input"])
-            filled_object = False
-            if object_input.count() > 0:
-                 try:
-                     expect(object_input).to_be_visible(timeout=timeouts["element_wait"])
-                     object_input.fill(search_params["object_keyword"])
-                     logging.info("Filled object keyword using primary input selector.")
-                     filled_object = True
-                     page.wait_for_timeout(500)
-                 except Exception as e:
-                     logging.warning(f"Primary object input selector {selectors['object_input']} failed: {e}. Trying fallback.")
-
-            if not filled_object:
-                 logging.info("Trying object keyword textarea fallback...")
-                 textarea_fallback = page.locator(selectors["object_input_fallback"])
-                 if textarea_fallback.count() > 0:
-                     try:
-                         expect(textarea_fallback.first).to_be_visible(timeout=timeouts["element_wait"])
-                         textarea_fallback.first.fill(search_params["object_keyword"])
-                         logging.info("Filled object keyword using textarea fallback.")
-                         filled_object = True
-                         page.wait_for_timeout(500)
-                     except Exception as fallback_e:
-                         logging.error(f"Textarea fallback for object keyword also failed: {fallback_e}")
-                 else:
-                     logging.error("Object keyword textarea fallback selector not found.")
-
-            if not filled_object:
-                 raise Exception("Critical Error: Could not fill the Object Keyword field.")
-
-            logging.info("Search form filled.")
-            safe_screenshot(page, f"form_filled_{keyword}")
-
-            # --- Execute Search ---
-            logging.info("Clicking search button...")
-            # Use the helper function to find and click
-            search_clicked = find_and_click_element(
-                page,
-                [selectors["search_button"], selectors["search_button_fallback"]],
-                "Search button"
-            )
-
-            if not search_clicked:
-                 raise Exception("Failed to click the search button.")
-
-            # --- Process Results ---
-            process_search_results(page, processed_ids)
-
-            logger.info(f"Finished processing keyword: {keyword}")
-
-        except PlaywrightTimeoutError as pte:
-             logging.critical(f"A Playwright timeout error occurred for keyword {keyword}: {pte}")
-             if page: safe_screenshot(page, f"error_timeout_state_{keyword}")
-        except Exception as e:
-            logging.critical(f"An unexpected error occurred during automation for keyword {keyword}: {e}", exc_info=True)
-            if page: safe_screenshot(page, f"error_unexpected_state_{keyword}")
-        finally:
-            # --- Cleanup ---
-            logging.info(f"Cleaning up for keyword: {keyword}...")
-            if page and CONFIG["headless_mode"] is False and not page.is_closed():
-                 try:
-                     # Keep browser open briefly in headful mode for final inspection
-                     logging.info("Keeping browser open for 10 seconds before closing (headful mode)...")
-                     page.wait_for_timeout(10000)
-                 except Exception:
-                      pass # Ignore errors if page is already closing
-
-            if context:
+            for keyword in keywords:
+                # Create a fresh config for this keyword iteration to ensure object_keyword is specific
+                keyword_specific_config = _get_dynamic_config(output_dir, company_id, search_keyword_override=keyword)
+                
+                logger.info(f"Processing keyword: {keyword} with config: {keyword_specific_config['search_params']['object_keyword']}")
                 try:
-                    context.close()
-                    logging.info("Browser context closed.")
+                    # _process_single_keyword is expected to do the scraping and return tender data for that keyword
+                    tenders_for_keyword = _process_single_keyword(page, keyword, keyword_specific_config)
+                    if tenders_for_keyword:
+                        all_processed_tenders.extend(tenders_for_keyword)
+                        logger.info(f"Collected {len(tenders_for_keyword)} tenders for keyword '{keyword}'.")
+                    else:
+                        logger.info(f"No new tenders found for keyword '{keyword}'.")
                 except Exception as e:
-                    logging.warning(f"Error closing context: {e}")
-            if browser:
-                try:
-                    browser.close()
-                    logging.info("Browser closed.")
-                except Exception as e:
-                    logging.warning(f"Error closing browser: {e}")
-            logging.info(f"Cleanup complete for keyword: {keyword}.")
-
-def main():
-    """Main function to run the web scraping process for multiple keywords."""
-    # Ensure all output directories exist
-    setup_output_dirs()
-    
-    logger.info(f"Script started. Downloads will be saved to: {CONFIG['downloads_dir']}")
-    logger.info(f"Screenshots enabled: {CONFIG['take_screenshots']}")
-    logger.info(f"Headless mode: {CONFIG['headless_mode']}")
-    logger.info(f"Details page timeout: {DETAILS_PAGE_TIMEOUT} seconds")
-    logger.info(f"Will process {len(KEYWORDS)} keywords: {KEYWORDS}")
-
-    # Process each keyword in the list
-    for keyword in KEYWORDS:
-        try:
-            process_keyword(keyword)
+                    logger.error(f"Error processing keyword '{keyword}': {e}", exc_info=True)
+                    safe_screenshot(page, f"ERROR_processing_{keyword}")
+                    # Decide if we should continue to the next keyword or re-raise
+                    # For now, log and continue
+                finally:
+                    # Ensure we are back on the search page or a known state before next keyword
+                    try:
+                        if not page.is_closed() and page.url != CONFIG["target_url"]:
+                             return_to_search_results(page)
+                    except Exception as e_nav:
+                        logger.error(f"Error trying to return to search results before next keyword: {e_nav}")
+                        # If navigation fails badly, might need to restart page/context for next keyword
+                        # For simplicity now, we'll assume it can recover or next keyword starts fresh with goto
+            
+            browser.close()
         except Exception as e:
-            logger.error(f"Failed to process keyword '{keyword}': {e}")
-            # Continue with next keyword even if this one fails
-    
-    logger.info("Script finished processing all keywords.")
+            logger.critical(f"Playwright setup or critical error in CAGECE handler: {e}", exc_info=True)
+            # Ensure browser is closed if it exists and an error occurs early
+            if 'browser' in locals() and browser.is_connected():
+                browser.close()
+            # Return any tenders processed so far, or an empty list
+            return all_processed_tenders 
 
-
-if __name__ == "__main__":
-    main()
+    logger.info(f"CAGECE handler finished. Total tenders collected: {len(all_processed_tenders)}")
+    return all_processed_tenders
