@@ -3,25 +3,24 @@
 Sanepar Download Handler for Procurement Download System
 
 Handles downloading documents from the Sanepar procurement portal (licitacoes.sanepar.com.br).
+This handler is designed to be called by the dispatcher in handlers/__main__.py.
 
 Workflow:
 1. Navigates to the main listing page (SLI11000.aspx).
-2. Filters processes based on keywords in the 'Objeto' column.
-3. Avoids reprocessing using a state file (processed_sanepar.json).
+2. Filters processes based on provided keywords in the 'Objeto' column.
+3. Avoids reprocessing using a state file (e.g., processed_sanepar.json) within the output directory.
 4. For matching processes, navigates to the detail page (SLI11100.aspx).
 5. Downloads attachments by simulating form POST requests.
 6. Extracts 'Lote' table data and generates a separate PDF.
 7. Creates a ZIP archive containing all downloaded files for each process.
-
-Usage:
-    python dynamic_handler_sanepar.py --url URL --output-dir DIR [--timeout SECONDS]
+8. Returns a list of structured data for processed tenders.
 """
 
 import os
 import sys
 import json
 import time
-import argparse
+
 import logging
 import re
 import traceback
@@ -52,49 +51,87 @@ except ImportError:
     }))
     sys.exit(1)
 
-# --- Logging Configuration ---
-# Use absolute path for downloads base directory
-script_dir = os.path.dirname(os.path.abspath(__file__))
-# Navigate up two levels from handlers/ to the main project dir, then into downloads
-base_download_dir = os.path.abspath(os.path.join(script_dir, '..', '..', 'downloads'))
+# Logger will be configured by setup_logging() called within run_handler.
+logger = logging.getLogger("SaneparHandler") # Placeholder, will be reconfigured
 
-log_dir = os.path.join(base_download_dir, "logs")
-os.makedirs(log_dir, exist_ok=True)
+def setup_logging(log_output_dir: str, company_id: str, handler_name: str = "SaneparHandler") -> logging.Logger:
+    """Configures and returns a logger for the handler."""
+    current_logger = logging.getLogger(handler_name)
+    current_logger.handlers.clear() # Remove any existing handlers
+    current_logger.propagate = False # Prevent duplicate logs in parent loggers
 
-log_file = f"dynamic_handler_sanepar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-log_path = os.path.join(log_dir, log_file)
+    log_dir_path = os.path.join(log_output_dir, "logs")
+    os.makedirs(log_dir_path, exist_ok=True)
 
-logging.basicConfig(
-    level=logging.INFO, # Changed to INFO for production, DEBUG for development
-    format='%(asctime)s - %(levelname)s - [%(name)s:%(lineno)d] - %(message)s',
-    handlers=[
-        logging.FileHandler(log_path, encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger("SaneparHandler")
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file_name = f"dynamic_handler_{handler_name.lower()}_{company_id}_{timestamp}.log"
+    log_file_path = os.path.join(log_dir_path, log_file_name)
+
+    # Create file handler
+    file_handler = logging.FileHandler(log_file_path, encoding='utf-8')
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(name)s:%(lineno)d] - %(message)s')
+    file_handler.setFormatter(file_formatter)
+
+    # Create stream handler (for console output)
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s') # Simpler format for console
+    stream_handler.setFormatter(stream_formatter)
+
+    current_logger.addHandler(file_handler)
+    current_logger.addHandler(stream_handler)
+    current_logger.setLevel(logging.INFO) # Default to INFO, can be made configurable
+
+    logger.info(f"Logging initialized. Log file: {log_file_path}")
+    return current_logger
 
 # --- Configuration ---
-KEYWORDS = ["tubo", "polietileno", "PEAD", "polimero", "PAM", "hidrômetro", "medidor"]
-PROCESSED_FILE = "/Users/gabrielreginatto/Desktop/Code/DownloadEditalAnalise/downloads/processed_sanepar.json"
-ARCHIVE_DIR = os.path.join(base_download_dir, "archives")
+# KEYWORDS will be passed as an argument to run_handler.
+# The PROCESSED_FILE path will be derived from output_dir (e.g., os.path.join(output_dir, "processed_sanepar.json")).
+# ARCHIVE_DIR will be derived from output_dir (e.g., os.path.join(output_dir, "archives")).
+ARCHIVE_SUBDIR_NAME = "archives" # Name of the archive subdirectory within output_dir
+PROCESSED_FILE_NAME = "processed_sanepar.json" # Name of the state file within output_dir
 BASE_URL = "https://licitacoes.sanepar.com.br/"
 
 # --- Processed State Management ---
-def load_processed():
-    if not os.path.exists(PROCESSED_FILE):
-        with open(PROCESSED_FILE, 'w', encoding='utf-8') as f:
-            json.dump([], f)
+def load_processed(processed_file_path: str) -> Set[str]:
+    """Loads the set of processed item identifiers from the state file."""
+    if not os.path.exists(processed_file_path):
+        try:
+            # Ensure parent directory exists
+            os.makedirs(os.path.dirname(processed_file_path), exist_ok=True)
+            with open(processed_file_path, 'w', encoding='utf-8') as f:
+                json.dump([], f)
+            logger.info(f"Initialized new processed items file: {processed_file_path}")
+        except OSError as e:
+            logger.error(f"OSError creating processed items file {processed_file_path}: {e}")
+            return set() # Return empty if directory creation fails
+        except Exception as e:
+            logger.error(f"Failed to create or initialize processed items file {processed_file_path}: {e}")
+            return set() # Return empty if creation fails
         return set()
     try:
-        with open(PROCESSED_FILE, 'r', encoding='utf-8') as f:
+        with open(processed_file_path, 'r', encoding='utf-8') as f:
             return set(json.load(f))
-    except Exception:
+    except FileNotFoundError:
+        logger.warning(f"Processed items file not found {processed_file_path}, treating as empty. Will create on save.")
+        return set()
+    except json.JSONDecodeError as e:
+        logger.error(f"Error decoding JSON from processed items file {processed_file_path}: {e}. Treating as empty.")
+        # Optionally, attempt to re-initialize or backup the corrupted file here
+        return set()
+    except Exception as e:
+        logger.error(f"Unexpected error loading processed items file {processed_file_path}: {e}")
         return set()
 
-def save_processed(processed_set):
-    with open(PROCESSED_FILE, 'w', encoding='utf-8') as f:
-        json.dump(sorted(list(processed_set)), f, indent=2)
+def save_processed(processed_set: Set[str], processed_file_path: str):
+    """Saves the set of processed item identifiers to the state file."""
+    try:
+        os.makedirs(os.path.dirname(processed_file_path), exist_ok=True)
+        with open(processed_file_path, 'w', encoding='utf-8') as f:
+            json.dump(sorted(list(processed_set)), f, indent=2)
+        logger.debug(f"Saved {len(processed_set)} items to processed file: {processed_file_path}")
+    except Exception as e:
+        logger.error(f"Failed to save processed items to file {processed_file_path}: {e}")
 
 # --- Helper Functions ---
 
@@ -105,21 +142,20 @@ def setup_output_dirs(base_dir):
 
     output_dirs = {
         'pdf': os.path.join(base_dir_abs, 'pdfs'),
-        'archive': os.path.join(base_dir_abs, 'archives'),
+        'archive': os.path.join(base_dir_abs, ARCHIVE_SUBDIR_NAME),
         'debug': os.path.join(base_dir_abs, 'debug'),
-        'logs': log_dir, # Use pre-defined absolute log_dir
+        'logs': os.path.join(base_dir_abs, 'logs'), # Log directory within the main output_dir
         'screenshots': os.path.join(base_dir_abs, 'debug', 'screenshots'),
-        'temp': os.path.join(base_dir_abs, 'temp'),
-        'state': base_dir_abs # For the state file
+        'temp': os.path.join(base_dir_abs, 'temp')
+        # 'state' directory is the base_dir_abs itself, handled by load/save_processed
     }
 
     for key, dir_path in output_dirs.items():
-        if key != 'state': # Don't create the state file itself as a directory
             try:
                 os.makedirs(dir_path, exist_ok=True)
                 # logger.debug(f"Directory ensured: {dir_path}")
             except OSError as e:
-                logger.error(f"Failed to create directory {dir_path}: {e}")
+                logger.error(f"Skipping attachment for {processo_num_clean} due to download error: {e}")
                 raise
 
     return output_dirs
@@ -173,9 +209,9 @@ def create_zip_archive(file_paths: list[str], output_zip_path: str) -> bool:
                 logger.error(f"Failed to remove partial zip {output_zip_path}: {rm_e}")
         return False
 
-async def generate_lot_pdf(page: Page, context: BrowserContext, target_pdf_path: str):
+async def generate_lot_pdf(page: Page, context: BrowserContext, pdf_path: str, logger: logging.Logger) -> bool:
     """Extracts Lot data and generates a PDF report."""
-    logger.info("Extracting Lot data...")
+    logger.info("Extracting Lot data for PDF report...")
     lot_data = {}
     current_lot = "Desconhecido"
 
@@ -191,7 +227,7 @@ async def generate_lot_pdf(page: Page, context: BrowserContext, target_pdf_path:
                 match = re.search(r'LOTE\s*(\d+)', lot_text, re.IGNORECASE)
                 current_lot = f"Lote {match.group(1)}" if match else lot_text.strip()
                 lot_data[current_lot] = []
-                logger.debug(f"Found header for: {current_lot}")
+                logger.debug(f"PDF Gen - Found header for: {current_lot}")
                 continue
 
             # Check if it's an Item Row (excluding the small font sub-rows)
@@ -202,7 +238,16 @@ async def generate_lot_pdf(page: Page, context: BrowserContext, target_pdf_path:
                 if len(cells) == 4:
                     item_num = (await cells[0].text_content() or "").strip()
                     descricao = (await cells[1].text_content() or "").strip()
-                    qtde = (await cells[2].text_content() or "").strip()
+                    objeto_text = (await cells[2].text_content() or "").strip()
+
+            # Keyword Filtering
+            if keywords: # Only filter if keywords are provided
+                objeto_text_lower = objeto_text.lower()
+                if not any(keyword.lower() in objeto_text_lower for keyword in keywords):
+                    logger.debug(f"Processo {processo_num} | Objeto '{objeto_text[:100]}...' does not match keywords. Skipping.")
+                    continue
+            else:
+                logger.debug("No keywords provided, processing all items.")
                     un = (await cells[3].text_content() or "").strip()
                     if item_num: # Only add if item number is present
                          lot_data.setdefault(current_lot, []).append({
@@ -211,11 +256,11 @@ async def generate_lot_pdf(page: Page, context: BrowserContext, target_pdf_path:
                             "Qtde": qtde,
                             "UN": un
                          })
-                         # logger.debug(f" Extracted Item: {item_num} for {current_lot}")
+                         logger.debug(f"PDF Gen - Item Data for Lot '{current_lot}': {item_num} - {descricao} - {qtde} - {un}")
 
 
         if not lot_data or all(not items for items in lot_data.values()):
-            logger.warning("No valid Lot data extracted.")
+            logger.warning("PDF Gen - No Lot data found or extracted.")
             return False
 
         # Generate HTML for PDF
@@ -271,12 +316,12 @@ async def generate_lot_pdf(page: Page, context: BrowserContext, target_pdf_path:
         # Generate PDF using Playwright
         temp_pdf_page = None
         try:
-            logger.info(f"Generating Lot PDF: {target_pdf_path}")
+            logger.info(f"PDF Gen - Generating Lot PDF at: {pdf_path}")
             temp_pdf_page = await context.new_page()
             await temp_pdf_page.set_content(html_content, wait_until="domcontentloaded")
-            await temp_pdf_page.pdf(path=target_pdf_path, format='A4',
+            await temp_pdf_page.pdf(path=pdf_path, format='A4',
                                     margin={'top': '20px', 'bottom': '20px', 'left': '20px', 'right': '20px'})
-            logger.info(f"Successfully generated Lot PDF: {target_pdf_path}")
+            logger.info(f"PDF Gen - Successfully generated Lot PDF: {pdf_path}")
             return True
         except Exception as pdf_err:
             logger.error(f"Failed to generate Lot PDF: {pdf_err}", exc_info=True)
@@ -286,21 +331,35 @@ async def generate_lot_pdf(page: Page, context: BrowserContext, target_pdf_path:
                 await temp_pdf_page.close()
 
     except Exception as e:
-        logger.error(f"Error extracting Lot data: {e}", exc_info=True)
+        logger.error(f"PDF Gen - Error generating Lot PDF: {e}", exc_info=True)
         return False
 
 
-async def process_detail_page(page: Page, context: BrowserContext, objeto_clean: str, processo_num_clean: str, processo_num_id: str, output_dirs: Dict[str, str]) -> bool:
+async def process_detail_page(page: Page, context: BrowserContext, tender_data_from_search: Dict, output_dirs: Dict[str, str], logger: logging.Logger) -> Optional[Dict]:
     """Handles downloading attachments and generating Lot PDF for a specific process."""
+    processo_num_id = tender_data_from_search.get('processo_num_id', 'unknown_id')
+    processo_num_clean = tender_data_from_search.get('processo_num_clean', 'unknown_process')
+    # objeto_clean = tender_data_from_search.get('objeto_clean', 'unknown_objeto') # Already cleaned, from search page
+
     logger.info(f"--- Processing Detail Page for Process: {processo_num_clean} (ID: {processo_num_id}) ---")
-    temp_process_dir = os.path.join(output_dirs['temp'], processo_num_clean)
+    
+    processed_tender_data = tender_data_from_search.copy()
+    processed_tender_data.update({
+        "status": "Failed", # Default to Failed, update on success
+        "processing_timestamp_detail_start": datetime.now().isoformat(),
+        "downloaded_files_paths": [],
+        "zip_archive_path": None,
+        "lot_pdf_path": None,
+        "error_message_detail": None
+    })
+
+    temp_process_dir = os.path.join(output_dirs['temp'], processo_num_clean) # Use cleaned name for temp dir
     os.makedirs(temp_process_dir, exist_ok=True)
-    downloaded_file_paths = []
-    final_zip_success = False
+    # downloaded_file_paths is now part of processed_tender_data
 
     try:
         await page.wait_for_load_state("networkidle", timeout=60000)
-        await page.screenshot(path=os.path.join(output_dirs['screenshots'], f"detail_{processo_num_clean}_1_initial.png"))
+        await page.screenshot(path=os.path.join(output_dirs['screenshots'], f"detail_{processo_num_clean}_1_initial.png")) # uses processo_num_clean from above
 
         # --- Step 1: Download Attachments ---
         logger.info("Extracting attachment information...")
@@ -314,9 +373,9 @@ async def process_detail_page(page: Page, context: BrowserContext, objeto_clean:
             viewstategenerator = await page.locator('#__VIEWSTATEGENERATOR').input_value(timeout=5000)
             eventvalidation = await page.locator('#__EVENTVALIDATION').input_value(timeout=5000)
         except Exception as state_err:
-            logger.error(f"Failed to extract ASP.NET state fields: {state_err}")
-            await page.screenshot(path=os.path.join(output_dirs['screenshots'], f"detail_{processo_num_clean}_2_state_error.png"))
-            return False # Cannot proceed without state
+            logger.error(f"Could not extract ASP.NET state for {processo_num_clean}: {state_err}")
+            processed_tender_data['error_message_detail'] = f"Could not extract ASP.NET state: {state_err}"
+            return processed_tender_data
 
         # Extract document IDs and labels
         documents_info = await page.evaluate("""() => {
@@ -327,6 +386,10 @@ async def process_detail_page(page: Page, context: BrowserContext, objeto_clean:
         }""")
 
         if not documents_info:
+            logger.warning(f"No attachments found for {processo_num_clean} or data extraction failed.")
+            # This might not be a failure of the whole process if other data (like lot PDF) can be generated
+            # processed_tender_data['error_message_detail'] = "No attachments found or attachment data extraction failed."
+            # return processed_tender_data # Decide if this is a hard fail
             logger.warning(f"No attachment radio buttons found for process {processo_num_clean}.")
         else:
             logger.info(f"Found {len(documents_info)} attachments to download for process {processo_num_clean}.")
@@ -384,14 +447,13 @@ async def process_detail_page(page: Page, context: BrowserContext, objeto_clean:
                         final_filename += ext
                         logger.info(f"Guessed extension '{ext}' based on Content-Type or default.")
 
-
                     target_path = os.path.join(temp_process_dir, final_filename)
                     with open(target_path, 'wb') as f:
                          for chunk in response.iter_content(chunk_size=8192): f.write(chunk)
 
                     if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
                         logger.info(f"Successfully saved: {target_path}")
-                        downloaded_file_paths.append(target_path)
+                        processed_tender_data['downloaded_files_paths'].append(target_path)
                     else:
                         logger.warning(f"Downloaded file is empty or missing: {target_path}")
                         if os.path.exists(target_path): os.remove(target_path)
@@ -404,31 +466,42 @@ async def process_detail_page(page: Page, context: BrowserContext, objeto_clean:
 
         # --- Step 2: Generate Lot PDF ---
         lot_pdf_filename = f"Lotes_{processo_num_clean}.pdf"
-        lot_pdf_path = os.path.join(temp_process_dir, lot_pdf_filename)
-        if await generate_lot_pdf(page, context, lot_pdf_path):
+        # This is the path for the PDF specific to Lotes, correctly named lot_pdf_path.
+        lot_pdf_path = os.path.join(temp_process_dir, lot_pdf_filename) 
+        processed_tender_data['lot_pdf_path'] = lot_pdf_path # Store potential path for Lot PDF
+
+        if await generate_lot_pdf(page, context, lot_pdf_path, logger): # Pass logger
             if os.path.exists(lot_pdf_path) and os.path.getsize(lot_pdf_path) > 0:
-                 downloaded_file_paths.append(lot_pdf_path)
+                 processed_tender_data['downloaded_files_paths'].append(lot_pdf_path)
             else:
                  logger.warning(f"Lot PDF generation reported success but file is missing or empty: {lot_pdf_path}")
+                 processed_tender_data['lot_pdf_path'] = None # Clear if failed despite report
         else:
-            logger.error("Failed to generate Lot PDF.")
+            logger.error(f"Failed to generate Lot PDF for {processo_num_clean}.") # Added context
+            processed_tender_data['lot_pdf_path'] = None # Clear path on failure
 
         # --- Step 3: Create Final ZIP Archive ---
-        if downloaded_file_paths:
-            zip_filename = f"SANEPAR_{processo_num_clean}.zip"
+        if processed_tender_data['downloaded_files_paths']:
+            # Construct filename using cleaned process number and object description from search page data
+            objeto_for_zip = clean_filename(tender_data_from_search.get('objeto_clean', 'objeto'))
+            zip_filename = f"SANEPAR_{processo_num_clean}_{objeto_for_zip}.zip"
             zip_filepath = os.path.join(output_dirs['archive'], zip_filename)
-            if create_zip_archive(downloaded_file_paths, zip_filepath):
-                final_zip_success = True
+            
+            # Attempt to create the archive
+            if create_zip_archive(processed_tender_data['downloaded_files_paths'], zip_filepath):
+                logger.info(f"Successfully created ZIP archive: {zip_filepath} for {processo_num_clean}")
+                processed_tender_data['zip_archive_path'] = zip_filepath # Confirm path on success
             else:
-                logger.error(f"Failed to create final ZIP for {processo_num_clean}")
+                logger.error(f"Failed to create ZIP archive for {processo_num_clean} at {zip_filepath}")
+                processed_tender_data['zip_archive_path'] = None # Clear path on failure
+                processed_tender_data['error_message_detail'] = (processed_tender_data.get('error_message_detail') or "") + "Failed to create ZIP. "
         else:
-            logger.warning(f"No files were downloaded or generated for {processo_num_clean}, no ZIP created.")
-            # Consider success=True if the goal was just to check and there were no files?
-            # For now, require at least one file downloaded/generated for overall success.
-            final_zip_success = False
+            logger.warning(f"No files downloaded for {processo_num_clean}, skipping ZIP creation.")
+            processed_tender_data['zip_archive_path'] = None # Ensure no ZIP path if no files to ZIP
 
-    except Exception as e:
-        logger.error(f"Critical error processing detail page for {processo_num_clean}: {e}", exc_info=True)
+    except Exception as main_exception:
+        logger.error(f"Main error processing detail page for {processo_num_clean}: {main_exception}", exc_info=True)
+        processed_tender_data['error_message_detail'] = (processed_tender_data.get('error_message_detail') or "") + f"Main exception: {main_exception}"
         await page.screenshot(path=os.path.join(output_dirs['screenshots'], f"detail_{processo_num_clean}_9_critical_error.png"))
         final_zip_success = False
     finally:
@@ -436,17 +509,29 @@ async def process_detail_page(page: Page, context: BrowserContext, objeto_clean:
         try:
             if os.path.exists(temp_process_dir):
                 shutil.rmtree(temp_process_dir)
-                logger.debug(f"Cleaned up temp directory: {temp_process_dir}")
+                logger.debug(f"Cleaned up temp directory: {temp_process_dir} for {processo_num_clean}")
         except Exception as cleanup_e:
-            logger.error(f"Error cleaning temp dir {temp_process_dir}: {cleanup_e}")
+            logger.error(f"Error cleaning temp dir {temp_process_dir} for {processo_num_clean}: {cleanup_e}")
 
-    logger.info(f"--- Finished Processing Detail Page for Process: {processo_num_clean} | Success: {final_zip_success} ---")
-    return final_zip_success
+    # Determine final status
+    # Success if ZIP created OR (Lot PDF generated AND no files were expected/downloaded)
+    # This logic might need refinement based on what's considered a 'successful' partial processing
+    if processed_tender_data['zip_archive_path'] or (processed_tender_data['lot_pdf_path'] and not processed_tender_data['downloaded_files_paths']):
+        processed_tender_data['status'] = "Processed"
+    else:
+        processed_tender_data['status'] = "Failed"
+        if not processed_tender_data['error_message_detail']:
+             processed_tender_data['error_message_detail'] = "Processing completed but no archive or lot PDF was generated."
+
+    processed_tender_data['processing_timestamp_detail_end'] = datetime.now().isoformat()
+    logger.info(f"--- Finished Processing Detail Page for Process: {processo_num_clean} | Status: {processed_tender_data['status']} ---")
+    return processed_tender_data
 
 
-async def process_search_page(page: Page, context: BrowserContext, search_url: str, output_dirs: Dict[str, str], processed_state: Set[str]) -> Set[str]:
+async def process_search_page(page: Page, context: BrowserContext, search_url: str, output_dirs: Dict[str, str], processed_state: Set[str], keywords: List[str]) -> Tuple[Set[str], List[Dict]]:
     """Processes the main listing page, filters by keywords, and triggers detail page processing."""
-    newly_processed_in_this_run = set()
+    newly_processed_in_this_run: Set[str] = set()
+    processed_tenders_on_page: List[Dict] = []
     try:
         logger.info(f"Navigating to search results page: {search_url}")
         await page.goto(search_url, wait_until="networkidle", timeout=60000)
@@ -467,11 +552,11 @@ async def process_search_page(page: Page, context: BrowserContext, search_url: s
         except Exception as e:
             logger.error(f"Could not find table or rows on {search_url}: {e}")
             await page.screenshot(path=os.path.join(output_dirs['screenshots'], f"search_fail_table.png"))
-            return newly_processed_in_this_run # Cannot proceed
+            return newly_processed_in_this_run, processed_tenders_on_page # Cannot proceed
 
         if not rows:
             logger.info(f"No process rows found on {search_url}.")
-            return newly_processed_in_this_run
+            return newly_processed_in_this_run, processed_tenders_on_page
 
         # --- Extract Data and Filter ---
         rows_to_process: List[Dict] = []
@@ -501,34 +586,52 @@ async def process_search_page(page: Page, context: BrowserContext, search_url: s
                      continue
                 processo_num_id = match.group(1)
 
-                # Keyword Check
-                for keyword in KEYWORDS:
-                    # Use regex to match whole word only, case-insensitive
-                    if re.search(rf'\\b{re.escape(keyword)}\\b', objeto_text, re.IGNORECASE):
-                        processo_num_text = await processo_link_locator.text_content() or f"UnknownProcess_{processo_num_id}"
-                        processo_num_clean = clean_filename(processo_num_text.strip())
-                        objeto_clean = clean_filename(objeto_text.strip(), max_length=60)
-                        # State Check
-                        if processo_num_id in processed_state:
-                            logger.info(f"Row {i}: Process {processo_num_clean} (ID: {processo_num_id}) already processed (from state file). Skipping.")
-                            continue
-                        if processo_num_id in newly_processed_in_this_run:
-                            logger.info(f"Row {i}: Process {processo_num_clean} (ID: {processo_num_id}) already processed (this run). Skipping.")
-                            continue
-                        logger.info(f"Row {i}: Keyword match! Process: {processo_num_clean} (ID: {processo_num_id}), Objeto: '{objeto_text[:50]}...', Triggered by keyword: '{keyword}'")
-                        rows_to_process.append({
-                            "detail_page_url": urljoin(BASE_URL, href),
-                            "processo_num_id": processo_num_id,
-                            "processo_num_clean": processo_num_clean,
-                            "objeto_clean": objeto_clean
-                        })
-                        break  # Only queue once per process, even if multiple keywords match
+                # Keyword Filtering
+                # objeto_text was extracted from cells[1] earlier
+                should_process_item = True
+                if keywords: # Only filter if keywords are provided
+                    objeto_text_lower = objeto_text.lower()
+                    if not any(keyword.lower() in objeto_text_lower for keyword in keywords):
+                        logger.debug(f"Row {i} | Processo ID {processo_num_id} | Objeto '{objeto_text[:70]}...' does not match keywords. Skipping.")
+                        should_process_item = False
+                
+                if should_process_item:
+                    # If item passed keyword filter (or no keywords), proceed with state check and adding to rows_to_process
+                    processo_num_text = await processo_link_locator.text_content() or f"UnknownProcess_{processo_num_id}"
+                    processo_num_clean = clean_filename(processo_num_text.strip())
+                    # Use the already extracted objeto_text for cleaning, ensure it's the full description
+                    objeto_clean = clean_filename(objeto_text.strip(), max_length=150) # Increased max_length for more context
+                    
+                    # State Check
+                    if processo_num_id in processed_state:
+                        logger.info(f"Row {i}: Process {processo_num_clean} (ID: {processo_num_id}) already processed (from state file). Skipping.")
+                        continue # Skip to next row in the main loop
+                    if processo_num_id in newly_processed_in_this_run:
+                        logger.info(f"Row {i}: Process {processo_num_clean} (ID: {processo_num_id}) already processed (this run). Skipping.")
+                        continue # Skip to next row in the main loop
+                    
+                    # Attempt to get Publicação and Abertura dates from cells[2] and cells[3]
+                    # Assuming table structure: Processo (0), Objeto (1), Publicação (2), Abertura (3)
+                    publication_date_str = (await cells[2].text_content() or "").strip() if len(cells) > 2 else "N/A"
+                    opening_date_str = (await cells[3].text_content() or "").strip() if len(cells) > 3 else "N/A"
+
+                    logger.info(f"Row {i}: Adding to processing queue. Process: {processo_num_clean} (ID: {processo_num_id}), Objeto: '{objeto_text[:70]}...'. Link: {href}")
+                    rows_to_process.append({
+                        "detail_page_url": urljoin(BASE_URL, href),
+                        "processo_num_id": processo_num_id,
+                        "processo_num_clean": processo_num_clean,
+                        "objeto_clean": objeto_clean, 
+                        "original_objeto": objeto_text, 
+                        "publication_date_str": publication_date_str,
+                        "opening_date_str": opening_date_str,
+                        "link_row_text": processo_num_text
+                    })
 
              except Exception as row_err:
                  logger.error(f"Error extracting data from row {i}: {row_err}", exc_info=True)
 
         # --- Process Filtered Rows ---
-        logger.info(f"Processing details for {len(rows_to_process)} new processes matching keywords...")
+        logger.info(f"Processing details for {len(rows_to_process)} new processes...")
         for data in rows_to_process:
             processo_num_id = data['processo_num_id']
             detail_url = data['detail_page_url']
@@ -541,15 +644,25 @@ async def process_search_page(page: Page, context: BrowserContext, search_url: s
                 # Reuse the existing page to maintain session/cookies
                 await page.goto(detail_url, wait_until="networkidle", timeout=90000)
 
-                success = await process_detail_page(
-                    page, context, objeto, processo_num_clean, processo_num_id, output_dirs
+                detailed_tender_info = await process_detail_page(
+                    page, context, data, output_dirs, logger
                 )
 
-                if success:
-                    logger.info(f"Successfully processed detail page for {processo_num_clean}")
-                    newly_processed_in_this_run.add(processo_num_id)
+                if detailed_tender_info and detailed_tender_info.get('status') == "Processed":
+                    logger.info(f"Successfully processed detail page for {detailed_tender_info.get('processo_num_clean', processo_num_clean)}")
+                    newly_processed_in_this_run.add(detailed_tender_info.get('processo_num_id', processo_num_id))
+                    processed_tenders_on_page.append(detailed_tender_info) # Add to the list
+                elif detailed_tender_info: # It ran, but status might be 'Failed'
+                    logger.warning(f"Failed or partially processed detail page for {detailed_tender_info.get('processo_num_clean', processo_num_clean)}: {detailed_tender_info.get('error_message_detail', 'Unknown error')}")
+                    # Optionally, still add to processed_tenders_on_page if you want to record failed attempts with details
+                    # processed_tenders_on_page.append(detailed_tender_info) 
+                    # For now, we only add fully processed items to the main list that run_handler will use.
+                    # However, we should still mark it as 'processed' for this run to avoid retrying immediately if that's desired.
+                    newly_processed_in_this_run.add(detailed_tender_info.get('processo_num_id', processo_num_id))
                 else:
-                    logger.warning(f"Failed processing detail page for {processo_num_clean}")
+                    logger.error(f"Critical failure in process_detail_page for {processo_num_clean}, no data returned.")
+                    # Also mark as processed for this run to avoid looping on a critical error page if appropriate.
+                    newly_processed_in_this_run.add(processo_num_id)
 
                 # Navigate back robustly
                 logger.info(f"Navigating back to search results from {processo_num_clean}...")
@@ -587,15 +700,24 @@ async def process_search_page(page: Page, context: BrowserContext, search_url: s
         try: await page.screenshot(path=os.path.join(output_dirs['screenshots'], f"search_general_error.png"))
         except Exception: pass
 
-    return newly_processed_in_this_run
+    return newly_processed_in_this_run, processed_tenders_on_page
 
-async def handle_sanepar_download(url, output_dir, timeout=300):
+async def run_handler(company_id: str, output_dir: str, keywords: List[str], notion_database_id: Optional[str] = None, search_url: Optional[str] = None, timeout: int = 1800):
     """Main handler function for Sanepar downloads."""
+    nonlocal logger # Declare logger as nonlocal to modify the module-level one
+    logger = setup_logging(output_dir, company_id, handler_name="SaneparHandler")
+
     playwright = None; browser = None; context = None
     overall_success = False; processed_new_items_count = 0; error_message = None
+    all_processed_tenders: List[Dict] = [] # To store structured data of processed items
+
     try:
-        output_dirs = setup_output_dirs(output_dir)
-        processed_state = load_processed()
+        # Ensure output_dir is absolute as setup_output_dirs expects it
+        output_dir_abs = os.path.abspath(output_dir)
+        output_dirs = setup_output_dirs(output_dir_abs)
+        
+        processed_file_path = os.path.join(output_dir_abs, PROCESSED_FILE_NAME)
+        processed_state = load_processed(processed_file_path)
 
         playwright = await async_playwright().start()
         # Always run non-headless for this ASP.NET site initially, easier debugging
@@ -613,29 +735,32 @@ async def handle_sanepar_download(url, output_dir, timeout=300):
         )
         # Set longer default timeouts
         context.set_default_timeout(60000) # 60 seconds for actions
-        context.set_default_navigation_timeout(90000) # 90 seconds for navigations
-
         page = await context.new_page()
 
-        # Process the main search/listing page
-        newly_processed = await process_search_page(page, context, url, output_dirs, processed_state)
+        # Determine the search URL
+        search_url_to_use = search_url if search_url else urljoin(BASE_URL, "SLI11000.aspx")
+        logger.info(f"Navigating to Sanepar search page: {search_url_to_use} with keywords: {keywords}")
 
-        processed_new_items_count = len(newly_processed)
-        if newly_processed:
-            updated_state = processed_state.union(newly_processed)
-            save_processed(updated_state)
+        # Process the search page for relevant items
+        newly_processed_ids, tenders_from_page = await process_search_page(page, context, search_url_to_use, output_dirs, processed_state, keywords)
+        all_processed_tenders.extend(tenders_from_page)
+
+        processed_new_items_count = len(newly_processed_ids)
+        if newly_processed_ids:
+            updated_state = processed_state.union(newly_processed_ids)
+            save_processed(updated_state, processed_file_path)
             overall_success = True # Considered success if we processed *something* new
-        elif not newly_processed and processed_state:
-             logger.info(f"No new processes matching keywords found on {url} in this run.")
+        elif not newly_processed_ids and processed_state:
+             logger.info(f"No new processes matching keywords found on {search_url_to_use} in this run.")
              overall_success = True # Still success, just nothing new to do
         else:
-             logger.warning(f"No processes found or processed on {url}.")
+             logger.warning(f"No processes found or processed on {search_url_to_use}.")
              # If the initial page load failed inside process_search_page, overall_success might be false
              overall_success = False # Mark as fail if nothing was processed AND state is empty? debatable
              error_message = "Failed to find or process any relevant rows on the search page."
 
     except Exception as e:
-        logger.critical(f"Critical error in handle_sanepar_download for {url}: {e}", exc_info=True)
+        logger.critical(f"Critical error in run_handler for {search_url_to_use}: {e}", exc_info=True)
         overall_success = False
         error_message = f"Critical error: {e}"
     finally:
@@ -651,37 +776,11 @@ async def handle_sanepar_download(url, output_dir, timeout=300):
             except Exception as e: logger.error(f"Error stopping Playwright: {e}")
         logger.info("Playwright resources cleaned up.")
 
-    # Result for the orchestrator
-    result = {
+    # Final result structure for the dispatcher
+    return {
         "success": overall_success,
-        "url": url,
-        "file_path": None, # We output ZIPs, the orchestrator doesn't need a single path
+        "processed_tenders": all_processed_tenders, # Will be populated in later stages
         "error_message": error_message,
-        "processed_new_items_count": processed_new_items_count
+        "processed_new_items_count": processed_new_items_count,
+        "notion_database_id": notion_database_id # Pass it through
     }
-    print(json.dumps(result))
-    return 0 if overall_success else 1
-
-async def main():
-    """Parses arguments and runs the handler."""
-    parser = argparse.ArgumentParser(description="Sanepar Download Handler")
-    parser.add_argument("--url", required=True, help="URL of the Sanepar listing page (e.g., SLI11000.aspx)")
-    # Default to the calculated base_download_dir
-    parser.add_argument("--output-dir", default=base_download_dir, help=f"Base output directory (defaults to: {base_download_dir})")
-    parser.add_argument("--timeout", type=int, default=600, help="Overall timeout for the handler in seconds (approximate)")
-    args = parser.parse_args()
-
-    # Ensure output_dir is absolute
-    output_dir_abs = os.path.abspath(args.output_dir)
-
-    # Start the main download process
-    exit_code = await handle_sanepar_download(args.url, output_dir_abs, args.timeout)
-    sys.exit(exit_code)
-
-if __name__ == "__main__":
-    if sys.version_info >= (3, 7):
-        asyncio.run(main())
-    else:
-        # Compatibility for older Python versions if needed
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(main())

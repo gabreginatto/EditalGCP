@@ -13,29 +13,53 @@ This specialized handler:
 8. Manages state to avoid re-downloading already processed items.
 
 Usage:
-    python dynamic_handler_COPASA.py --url URL --output-dir DIR [--timeout SECONDS]
+    python dynamic_handler_copasa.py --url URL --output-dir DIR [--company-id ID] [--timeout SECONDS] [--headless]
 """
 
-import os
-import sys
-import json
-import time
 import argparse
-import logging
-import re
-import traceback
 import asyncio
+import json
+import logging
+import os
+import re
 import shutil
+import sys
+import time
+import traceback
 import zipfile
-import requests
-from pathlib import Path
-from urllib.parse import urlparse, unquote, urljoin
 from datetime import datetime
-from typing import Set, Dict, Optional, Tuple, List
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from urllib.parse import unquote, urljoin, urlparse
+
+import requests
+from playwright.async_api import (
+    BrowserContext,
+    Error as PlaywrightError,
+    Page,
+    TimeoutError as PlaywrightTimeoutError,
+    async_playwright,
+)
+
+# Disable insecure request warnings
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+# Default timeout for browser operations (in seconds)
+DEFAULT_TIMEOUT = 300
 
 # Import Playwright components
 try:
-    from playwright.async_api import async_playwright, Page, Locator, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
+    from playwright.async_api import async_playwright, Page, Locator, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError, BrowserContext
 except ImportError:
     # If playwright is not installed, return error JSON and exit
     print(json.dumps({
@@ -44,67 +68,115 @@ except ImportError:
     }))
     sys.exit(1)
 
-# --- Logging Configuration ---
-# Use absolute path for downloads base directory
-script_dir = os.path.dirname(os.path.abspath(__file__))
-# Navigate up two levels from handlers/ to the main project dir, then into downloads
-base_download_dir = os.path.abspath(os.path.join(script_dir, '..', '..', 'downloads'))
-
-log_dir = os.path.join(base_download_dir, "logs")
-os.makedirs(log_dir, exist_ok=True)
-
-log_file = f"dynamic_handler_copasa_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-log_path = os.path.join(log_dir, log_file)
-
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - [%(name)s:%(lineno)d] - %(message)s',
-    handlers=[
-        logging.FileHandler(log_path, encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger("COPASAHandler")
+# --- Helper Functions ---
+def setup_logging(output_dir: Path, company_id: str) -> Any:
+    """
+    Set up logging configuration for the handler.
+    
+    Args:
+        output_dir: Base output directory path
+        company_id: Company identifier for log file naming
+        
+    Returns:
+        Logger object configured for this handler
+    """
+    import logging
+    
+    # Create logs directory
+    log_dir = output_dir / company_id / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create log file with timestamp
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = f"dynamic_handler_copasa_{company_id}_{timestamp}.log"
+    log_path = log_dir / log_file
+    
+    # Configure logger
+    logger = logging.getLogger(f"COPASAHandler_{company_id}")
+    logger.setLevel(logging.DEBUG)
+    
+    # Clear any existing handlers (important for repeated runs)
+    if logger.hasHandlers():
+        logger.handlers.clear()
+    
+    # Add file handler
+    file_handler = logging.FileHandler(log_path, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    
+    # Add console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    
+    # Create formatter and add to handlers
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(name)s:%(lineno)d] - %(message)s')
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+    
+    # Add handlers to logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    logger.info(f"Logging initialized for COPASA handler for company_id: {company_id}")
+    return logger
 
 # --- Configuration ---
-STATE_FILE_NAME = "processed_copasa.json"
+STATE_FILE_NAME_TEMPLATE = "processed_copasa_{}.json"
 
 # --- Helper Functions ---
 
-def setup_output_dirs(base_dir):
-    """Ensure all necessary output directories exist relative to the base download dir."""
-    # Ensure base_dir is absolute
-    base_dir_abs = os.path.abspath(base_dir)
-    logger.info(f"Setting up directories relative to: {base_dir_abs}")
+def setup_output_dirs(base_dir: Path, company_id: str, logger: Any) -> Dict[str, Path]:
+    """
+    Ensure all necessary output directories exist relative to the base output directory.
+    Directory structure follows the pattern: base_dir/company_id/subdir
+    
+    Args:
+        base_dir: Base output directory path
+        company_id: Company identifier for directory structure
+        logger: Logger instance
+    
+    Returns:
+        Dictionary of output directory paths
+    """
+    # Ensure base_dir is a Path object
+    base_dir_path = Path(base_dir)
+    company_dir = base_dir_path / company_id
+    logger.info(f"Setting up directories relative to: {company_dir}")
 
     output_dirs = {
-        'pdf': os.path.join(base_dir_abs, 'pdfs'),
-        'archive': os.path.join(base_dir_abs, 'archives'),
-        'debug': os.path.join(base_dir_abs, 'debug'),
-        'logs': os.path.join(base_dir_abs, 'logs'), # Log dir is already created, but ensure it's here
-        'screenshots': os.path.join(base_dir_abs, 'debug', 'screenshots'),
-        'temp': os.path.join(base_dir_abs, 'temp'),
-        'state': base_dir_abs # For the state file
+        'archive': company_dir / 'archives',
+        'logs': company_dir / 'logs',  # Log dir is already created, but ensure it's here
+        'screenshots': company_dir / 'screenshots',
+        'temp': company_dir / 'temp',
+        'state': company_dir  # For the state file
     }
 
     for key, dir_path in output_dirs.items():
         # Only create directories, not the state file path itself
         if key != 'state':
             try:
-                os.makedirs(dir_path, exist_ok=True)
-                # logger.debug(f"Directory ensured: {dir_path}")
+                dir_path.mkdir(parents=True, exist_ok=True)
+                logger.debug(f"Directory ensured: {dir_path}")
             except OSError as e:
                 logger.error(f"Failed to create directory {dir_path}: {e}")
-                raise # Reraise if directory creation fails
+                raise  # Reraise if directory creation fails
 
     return output_dirs
 
 def clean_filename(filename: str, max_length: int = 100) -> str:
-    """Clean a filename to make it safe for the filesystem."""
+    """
+    Clean a filename to make it safe for the filesystem.
+    
+    Args:
+        filename: The filename to clean
+        max_length: Maximum length for the filename
+        
+    Returns:
+        A cleaned, filesystem-safe filename
+    """
     if not filename:
         return f"unknown_file_{int(time.time())}"
     # Remove path components just in case
-    filename = os.path.basename(filename)
+    filename = Path(filename).name
     # Replace problematic characters
     filename = re.sub(r'[\\/*?:"<>|]', '_', filename)
     # Replace multiple spaces/underscores with a single underscore
@@ -113,8 +185,8 @@ def clean_filename(filename: str, max_length: int = 100) -> str:
     filename = filename.strip('_ ')
     # Limit length
     if len(filename) > max_length:
-        name, ext = os.path.splitext(filename)
-        ext = ext[:max_length] # Ensure extension doesn't exceed max length either
+        name, ext = Path(filename).stem, Path(filename).suffix
+        ext = ext[:max_length]  # Ensure extension doesn't exceed max length either
         name = name[:max_length - len(ext)]
         filename = name + ext
     # Handle case where filename becomes empty after cleaning
@@ -122,8 +194,18 @@ def clean_filename(filename: str, max_length: int = 100) -> str:
         return f"cleaned_empty_{int(time.time())}"
     return filename
 
-def create_zip_archive(file_paths: list[str], output_zip_path: str) -> bool:
-    """Create a ZIP archive containing multiple files."""
+def create_zip_archive(file_paths: List[Path], output_zip_path: Path, logger: Any) -> bool:
+    """
+    Create a ZIP archive containing multiple files.
+    
+    Args:
+        file_paths: List of paths to files to include in the archive
+        output_zip_path: Path where the ZIP file will be created
+        logger: Logger instance
+        
+    Returns:
+        True if successful, False otherwise
+    """
     if not file_paths:
         logger.warning(f"No files provided to create zip: {output_zip_path}")
         return False
@@ -132,10 +214,11 @@ def create_zip_archive(file_paths: list[str], output_zip_path: str) -> bool:
         logger.info(f"Creating ZIP archive: {output_zip_path} with {len(file_paths)} file(s)")
         with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for file_path in file_paths:
-                if os.path.exists(file_path):
+                file_path_obj = Path(file_path)
+                if file_path_obj.exists():
                     # Add file to zip using just its base name
-                    zipf.write(file_path, os.path.basename(file_path))
-                    logger.debug(f"Added {os.path.basename(file_path)} to {os.path.basename(output_zip_path)}")
+                    zipf.write(file_path_obj, file_path_obj.name)
+                    logger.debug(f"Added {file_path_obj.name} to {output_zip_path.name}")
                 else:
                     logger.warning(f"File not found, cannot add to zip: {file_path}")
         logger.info(f"Successfully created ZIP archive: {output_zip_path}")
@@ -143,18 +226,29 @@ def create_zip_archive(file_paths: list[str], output_zip_path: str) -> bool:
     except Exception as e:
         logger.error(f"Error creating ZIP archive {output_zip_path}: {e}", exc_info=True)
         # Attempt to remove partially created zip file
-        if os.path.exists(output_zip_path):
+        if output_zip_path.exists():
             try:
-                os.remove(output_zip_path)
+                output_zip_path.unlink()
             except Exception as rm_e:
                 logger.error(f"Failed to remove partial zip {output_zip_path}: {rm_e}")
         return False
 
-def load_processed_state(output_dirs: Dict[str, str]) -> Set[str]:
-    """Load the set of processed process numbers from the state file."""
-    state_file_path = os.path.join(output_dirs['state'], STATE_FILE_NAME)
+def load_processed_state(output_dirs: Dict[str, Path], company_id: str, logger: Any) -> Set[str]:
+    """
+    Load the set of processed process numbers from the state file.
+    
+    Args:
+        output_dirs: Dictionary of output directories
+        company_id: Company identifier for state file
+        logger: Logger instance
+        
+    Returns:
+        Set of processed process IDs
+    """
+    state_file_name = STATE_FILE_NAME_TEMPLATE.format(company_id)
+    state_file_path = output_dirs['state'] / state_file_name
     try:
-        if os.path.exists(state_file_path):
+        if state_file_path.exists():
             with open(state_file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 processed_set = set(data.get('processed_copasa_processos', []))
@@ -167,9 +261,18 @@ def load_processed_state(output_dirs: Dict[str, str]) -> Set[str]:
         logger.error(f"Error loading state file {state_file_path}: {e}. Starting fresh.", exc_info=True)
         return set()
 
-def save_processed_state(output_dirs: Dict[str, str], processed_set: Set[str]):
-    """Save the set of processed process numbers to the state file."""
-    state_file_path = os.path.join(output_dirs['state'], STATE_FILE_NAME)
+def save_processed_state(output_dirs: Dict[str, Path], processed_set: Set[str], company_id: str, logger: Any) -> None:
+    """
+    Save the set of processed process numbers to the state file.
+    
+    Args:
+        output_dirs: Dictionary of output directories
+        processed_set: Set of processed process IDs
+        company_id: Company identifier for state file
+        logger: Logger instance
+    """
+    state_file_name = STATE_FILE_NAME_TEMPLATE.format(company_id)
+    state_file_path = output_dirs['state'] / state_file_name
     try:
         data = {'processed_copasa_processos': sorted(list(processed_set))}
         with open(state_file_path, 'w', encoding='utf-8') as f:
@@ -178,76 +281,101 @@ def save_processed_state(output_dirs: Dict[str, str], processed_set: Set[str]):
     except (IOError, Exception) as e:
         logger.error(f"Error saving state file {state_file_path}: {e}", exc_info=True)
 
-async def download_file_requests(url: str, target_path: str, cookies: List[Dict], referer: str) -> bool:
-    """Download a single file using requests with session context."""
+async def download_file_requests(
+    url: str, 
+    target_path: Path, 
+    cookies: List[Dict], 
+    referer: str, 
+    logger: Any
+) -> Tuple[bool, Optional[Path]]:
+    """
+    Download a single file using requests with session context.
+    
+    Args:
+        url: URL to download from
+        target_path: Path where to save the downloaded file
+        cookies: List of cookies to use in the request
+        referer: Referer header value
+        logger: Logger instance
+        
+    Returns:
+        Tuple of (success: bool, downloaded_path: Optional[Path])
+    """
     try:
-        logger.info(f"Attempting download via requests: {url}")
-        logger.debug(f"Initial target path: {target_path}")
-
+        logger.info(f"Attempting download: {url}")
+        target_path = Path(target_path)
+        
+        # Ensure parent directory exists
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        
         session = requests.Session()
-        # Load cookies into session
+        
+        # Add cookies to session
         for cookie in cookies:
-            # Only add cookies that have necessary fields
-            if 'name' in cookie and 'value' in cookie and 'domain' in cookie and 'path' in cookie:
-                 session.cookies.set(cookie['name'], cookie['value'], domain=cookie['domain'], path=cookie['path'])
+            if all(k in cookie for k in ['name', 'value', 'domain', 'path']):
+                session.cookies.set(
+                    cookie['name'], 
+                    cookie['value'], 
+                    domain=cookie['domain'], 
+                    path=cookie['path']
+                )
             else:
-                 logger.warning(f"Skipping invalid cookie: {cookie}")
-
+                logger.warning(f"Skipping invalid cookie: {cookie}")
 
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Referer': referer
         }
 
-        # Disable insecure request warnings for verify=False
-        requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
+        # Disable insecure request warnings
+        requests.packages.urllib3.disable_warnings(
+            requests.packages.urllib3.exceptions.InsecureRequestWarning
+        )
 
-        response = session.get(url, headers=headers, stream=True, timeout=60, verify=False)
-        response.raise_for_status() # Raise exception for bad status codes
+        # Make the request
+        response = session.get(
+            url, 
+            headers=headers, 
+            stream=True, 
+            timeout=60, 
+            verify=False
+        )
+        response.raise_for_status()
 
-        # Handle potential filename issues from headers
-        filename_from_header = None
+        # Handle filename from Content-Disposition if available
         if 'Content-Disposition' in response.headers:
             cd = response.headers['Content-Disposition']
-            # Improved regex to handle different quoting and encoding prefixes
-            fname_match = re.search(r'filename\*?=(?:(?:UTF-8|utf-8)\'\')?["\']?([^"\';]+)["\']?', cd, re.IGNORECASE)
+            fname_match = re.search(
+                r'filename\*?=(?:(?:UTF-8|utf-8)\'\')?["\']?([^"\';]+)["\']?', 
+                cd, 
+                re.IGNORECASE
+            )
             if fname_match:
-                filename_from_header = unquote(fname_match.group(1))
-                logger.info(f"Filename from Content-Disposition: {filename_from_header}")
-                # Update target_path using the potentially more accurate filename
-                target_path = os.path.join(os.path.dirname(target_path), clean_filename(filename_from_header))
-                logger.info(f"Using filename from header for saving: {target_path}")
+                filename = unquote(fname_match.group(1))
+                target_path = target_path.parent / clean_filename(filename)
+                logger.info(f"Using filename from header: {target_path.name}")
 
-        # Ensure directory exists before writing
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-
-        logger.info(f"Saving downloaded file to: {target_path}")
-        with open(target_path, 'wb') as f:
-            downloaded_bytes = 0
+        # Stream the response to file
+        with target_path.open('wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
                     f.write(chunk)
-                    downloaded_bytes += len(chunk)
 
-        if downloaded_bytes > 0:
-            logger.info(f"Successfully downloaded {downloaded_bytes} bytes: {target_path}")
-            return True
+        if target_path.stat().st_size > 0:
+            logger.info(f"Downloaded {target_path.stat().st_size} bytes to {target_path}")
+            return True, target_path
         else:
-            logger.warning(f"Download completed but file is empty: {target_path}")
-            # Attempt to remove empty file
-            try:
-                os.remove(target_path)
-            except Exception:
-                pass
-            return False
+            logger.warning(f"Downloaded file is empty: {target_path}")
+            target_path.unlink(missing_ok=True)
+            return False, None
 
     except requests.exceptions.RequestException as e:
-        logger.error(f"Requests error downloading {url}: {e}")
-        return False
+        logger.error(f"Request error downloading {url}: {e}")
+        return False, None
     except Exception as e:
         logger.error(f"Unexpected error downloading {url}: {e}", exc_info=True)
-        return False
+        return False, None
 
 async def process_detail_page(page: Page, context, objeto_clean: str, processo_num_clean: str, output_dirs: Dict[str, str]) -> bool:
     """Handles finding and downloading attachments and the Relacao Materiais PDF."""
@@ -429,30 +557,30 @@ async def process_detail_page(page: Page, context, objeto_clean: str, processo_n
                     logger.info("PDF URL interception signal received.")
                 except asyncio.TimeoutError:
                     logger.warning("Timed out waiting for PDF request interception for Relacao Materiais.")
-                    await page.screenshot(path=os.path.join(output_dirs['screenshots'], f"detail_{processo_num_clean}_7_relacao_intercept_timeout.png"))
+                    await page.screenshot(path=output_dirs['screenshots'] / f"detail_{processo_num_clean}_7_relacao_intercept_timeout.png")
 
             # --- Download if URL was captured ---
             if pdf_request_url:
                 logger.info(f"Proceeding to download captured PDF URL: {pdf_request_url}")
                 target_filename = f"Relacao_Materiais_{processo_num_clean}.pdf"
-                target_path = os.path.join(temp_process_dir, clean_filename(target_filename))
+                target_path = output_dirs['archive'] / target_filename
                 cookies = await context.cookies()
                 if await download_file_requests(pdf_request_url, target_path, cookies, page.url):
                      # Check if the target path exists, but also look for other recently created PDF files
                      # in case the filename was changed by Content-Disposition header
-                     actual_file_path = target_path if os.path.exists(target_path) else None
+                     actual_file_path = target_path if target_path.exists() else None
                      if not actual_file_path:
                          # Look for any recently created PDF files in the temp directory
                          try:
-                             pdf_files = list(Path(temp_process_dir).glob('*.pdf'))
+                             pdf_files = list(output_dirs['archive'].glob('*.pdf'))
                              if pdf_files:
                                  # Get the most recently created PDF file
-                                 actual_file_path = str(max(pdf_files, key=os.path.getctime))
+                                 actual_file_path = max(pdf_files, key=os.path.getctime)
                                  logger.info(f"Using actual downloaded PDF path: {actual_file_path}")
                          except Exception as find_err:
                              logger.error(f"Error finding actual PDF file: {find_err}")
                      
-                     if actual_file_path and os.path.exists(actual_file_path): 
+                     if actual_file_path and actual_file_path.exists(): 
                          downloaded_file_paths.append(actual_file_path)
                          relacao_downloaded_this_step = True
                      else:
@@ -481,7 +609,7 @@ async def process_detail_page(page: Page, context, objeto_clean: str, processo_n
         # ---------------------------------
         if downloaded_file_paths:
             zip_filename = f"{objeto_clean}_{processo_num_clean}.zip"
-            zip_filepath = os.path.join(output_dirs['archive'], zip_filename)
+            zip_filepath = output_dirs['archive'] / zip_filename
             if create_zip_archive(downloaded_file_paths, zip_filepath):
                 final_zip_success = True
                 if not relacao_downloaded_this_step and relacao_processed:
@@ -658,15 +786,79 @@ async def handle_copasa_download(url, output_dir, timeout=300):
     print(json.dumps(result))
     return 0 if overall_success else 1
 
-async def main():
-    parser = argparse.ArgumentParser(description="COPASA Download Handler")
-    parser.add_argument("--url", required=True, help="URL of the COPASA search results page")
-    parser.add_argument("--output-dir", default=base_download_dir, help=f"Base output directory (defaults to: {base_download_dir})")
-    parser.add_argument("--timeout", type=int, default=600, help="Overall timeout for the handler in seconds")
+async def main() -> None:
+    """
+    Main entry point for the script.
+    
+    Handles command-line arguments and executes the download process.
+    """
+    parser = argparse.ArgumentParser(
+        description='Download attachments from COPASA procurement portal.',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    # Required arguments
+    parser.add_argument(
+        '--url',
+        required=True,
+        help='URL of the COPASA search results page to start scraping from'
+    )
+    
+    parser.add_argument(
+        '--output-dir',
+        required=True,
+        help='Base directory for saving downloaded files and logs'
+    )
+    
+    # Optional arguments
+    parser.add_argument(
+        '--company-id',
+        default='copasa',
+        help='Company identifier used for organizing output files and logs'
+    )
+    
+    parser.add_argument(
+        '--timeout',
+        type=int,
+        default=300,
+        help='Timeout in seconds for browser operations'
+    )
+    
+    parser.add_argument(
+        '--headless',
+        action='store_true',
+        help='Run browser in headless mode (no GUI)'
+    )
+    
+    # Parse command line arguments
     args = parser.parse_args()
-    output_dir_abs = os.path.abspath(args.output_dir)
-    exit_code = await handle_copasa_download(args.url, output_dir_abs, args.timeout)
-    sys.exit(exit_code)
+    
+    try:
+        # Run the download handler
+        result = asyncio.run(
+            handle_copasa_download(
+                url=args.url,
+                output_dir=args.output_dir,
+                company_id=args.company_id,
+                timeout=args.timeout,
+                headless=args.headless
+            )
+        )
+        
+        # Print the result as JSON
+        print(json.dumps(result, indent=2))
+        
+        # Exit with appropriate status code
+        sys.exit(0 if result.get('success', False) else 1)
+        
+    except KeyboardInterrupt:
+        print("\nOperation cancelled by user.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"\nError: {str(e)}", file=sys.stderr)
+        if hasattr(e, '__traceback__'):
+            traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
     if sys.version_info >= (3, 7):
