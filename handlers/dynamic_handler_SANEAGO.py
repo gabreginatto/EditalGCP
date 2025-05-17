@@ -4,35 +4,28 @@ SANEAGO Download Handler for Procurement Download System
 
 Handles downloading procurement documents from SANEAGO's procurement portal
 using Stagehand JavaScript automation. This handler is designed to be called
-by the dispatcher.
+by the dispatcher in handlers/__main__.py.
 
 Workflow:
-1. Receives a URL, company_id, output directory, and timeout.
-2. Sets up logging and output directories under the main output_dir.
-3. Ensures Node.js and npm dependencies for the Stagehand script are ready.
-   (Optimized to skip 'npm install' if node_modules and package-lock.json exist).
-4. Executes the Stagehand JavaScript handler (handler_saneago.js) via Node.js,
-   passing the target URL and a Stagehand-specific temporary download directory.
-5. The Stagehand script performs the download and places files (expected as a single .zip)
-   in its temporary download directory.
-6. This Python handler moves the downloaded .zip file from the Stagehand temporary
-   location to the designated 'archives' directory within the main output_dir.
-7. Returns a JSON result indicating success/failure, the original URL,
-   the path to the downloaded archive (if successful), and any error messages.
+1. Receives the standard parameters: company_id, output_dir, keywords, notion_database_id
+2. Sets up logging and output directories under the main output_dir
+3. Ensures Node.js and npm dependencies for the Stagehand script are ready
+4. Executes the Stagehand JavaScript handler (handler_saneago.js) via Node.js
+5. Processes the downloaded file and returns standardized results structure
 
-Usage (CLI for testing):
-    python dynamic_handler_SANEAGO.py --company-id <COMPANY_ID> --url <URL> --output-dir <DIR> [--timeout SECONDS]
+Usage (when called by dispatcher):
+    python -m handlers --company-id SANEAGO --output-dir DIR --notion-db-id DB_ID [--keywords KEYWORD1 KEYWORD2...]
 """
 
 import os
 import sys
 import json
 import time
-import argparse
 import logging
 import subprocess
 import shutil
 import glob
+import re
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Tuple, Optional, Any, List
@@ -47,10 +40,14 @@ STAGEHAND_DIR = HANDLER_DIR / "stagehand"
 STAGEHAND_HANDLER_SCRIPT_NAME = "handler_saneago.js"
 STAGEHAND_HANDLER_SCRIPT_PATH = STAGEHAND_DIR / STAGEHAND_HANDLER_SCRIPT_NAME
 
+# Standard directory structure - same as other handlers
 ARCHIVE_SUBDIR_NAME = "archives"
 LOG_SUBDIR_NAME = "logs"
 TEMP_SUBDIR_NAME = "temp"
-STAGEHAND_TEMP_DOWNLOADS_SUBDIR_NAME = "stagehand_saneago_dl" # Specific to this handler's Stagehand output
+STAGEHAND_TEMP_DOWNLOADS_SUBDIR_NAME = "stagehand_saneago_dl"
+
+# Default target URL (may be overridden by config)
+DEFAULT_TARGET_URL = "https://www.saneago.com.br/licitacoes/"
 
 # Placeholder logger, will be replaced by setup_logging
 logger = logging.getLogger(f"{HANDLER_NAME}_placeholder")
@@ -59,10 +56,10 @@ logger = logging.getLogger(f"{HANDLER_NAME}_placeholder")
 def setup_logging(log_output_dir: str, company_id: str, handler_name_prefix: str = HANDLER_NAME) -> logging.Logger:
     """Configures and returns a logger for the handler."""
     current_logger = logging.getLogger(handler_name_prefix)
-    # Clear any existing handlers to prevent duplicate logging or conflicts if re-initialized
-    if current_logger.hasHandlers():
+    # Clear any existing handlers to prevent duplicate logging
+    if current_logger.handlers:
         current_logger.handlers.clear()
-    current_logger.propagate = False # Prevent duplicate logs in parent/root loggers
+    current_logger.propagate = False  # Prevent duplicate logs in parent loggers
 
     log_dir_path = Path(log_output_dir) / LOG_SUBDIR_NAME
     log_dir_path.mkdir(parents=True, exist_ok=True)
@@ -78,12 +75,12 @@ def setup_logging(log_output_dir: str, company_id: str, handler_name_prefix: str
 
     # Create stream handler (for console output)
     stream_handler = logging.StreamHandler(sys.stdout)
-    stream_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s') # Simpler for console
+    stream_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')  # Simpler for console
     stream_handler.setFormatter(stream_formatter)
 
     current_logger.addHandler(file_handler)
     current_logger.addHandler(stream_handler)
-    current_logger.setLevel(logging.INFO) # Default to INFO
+    current_logger.setLevel(logging.INFO)  # Default to INFO
 
     return current_logger
 
@@ -96,7 +93,7 @@ def setup_output_dirs(base_output_dir: str, current_logger: logging.Logger) -> D
     output_dirs_map = {
         'base': base_dir_path,
         'archive': base_dir_path / ARCHIVE_SUBDIR_NAME,
-        'logs': base_dir_path / LOG_SUBDIR_NAME, # Ensured by setup_logging
+        'logs': base_dir_path / LOG_SUBDIR_NAME,  # Ensured by setup_logging
         'temp': base_dir_path / TEMP_SUBDIR_NAME,
         'stagehand_temp_downloads': base_dir_path / TEMP_SUBDIR_NAME / STAGEHAND_TEMP_DOWNLOADS_SUBDIR_NAME,
     }
@@ -109,9 +106,46 @@ def setup_output_dirs(base_output_dir: str, current_logger: logging.Logger) -> D
             current_logger.error(f"OSError creating directory {dir_path_obj}: {e}")
             # For critical directories, re-raise to halt execution if they can't be created
             if dir_key in ['archive', 'temp', 'stagehand_temp_downloads']:
-                 current_logger.critical(f"Failed to create critical directory: {dir_path_obj}")
-                 raise
+                current_logger.critical(f"Failed to create critical directory: {dir_path_obj}")
+                raise
     return output_dirs_map
+
+# --- Metadata Extraction ---
+def extract_tender_metadata(zip_filename: str, target_url: str) -> Tuple[str, str]:
+    """
+    Extract tender ID and title from the ZIP filename and URL.
+    
+    Args:
+        zip_filename: Name of the ZIP file downloaded
+        target_url: Source URL used for download
+        
+    Returns:
+        Tuple of (tender_id, title)
+    """
+    # Default values
+    tender_id = "SANEAGO_UNKNOWN"
+    title = "Unnamed SANEAGO Procurement"
+    
+    # Try to extract a better tender_id from filename (e.g., "Saneago_12345_ABC.zip")
+    if zip_filename.startswith("Saneago_"):
+        # Extract the numeric part after "Saneago_"
+        match = re.search(r'Saneago_(\d+)', zip_filename)
+        if match:
+            tender_id = f"SANEAGO-{match.group(1)}"
+    
+    # For title, use whatever is after the ID until the extension
+    name_without_extension = os.path.splitext(zip_filename)[0]
+    parts = name_without_extension.split('_')
+    if len(parts) > 2:  # If format is "Saneago_ID_Title"
+        title = ' '.join(parts[2:])
+    elif len(parts) > 1:  # If format is "Saneago_Title"
+        title = ' '.join(parts[1:])
+    
+    # If we couldn't extract a reasonable title, create one
+    if not title or len(title) < 5:
+        title = f"SANEAGO Procurement Document {datetime.now().strftime('%Y-%m-%d')}"
+    
+    return tender_id, title
 
 # --- Core Stagehand Execution ---
 def _run_stagehand_subprocess(
@@ -154,7 +188,7 @@ def _run_stagehand_subprocess(
                 current_logger.info("Missing node_modules or package-lock.json. Running 'npm install'...")
                 npm_proc = subprocess.run(
                     ["npm", "install"], cwd=str(STAGEHAND_DIR), check=True,
-                    capture_output=True, text=True, timeout=300 # 5 min timeout for npm install
+                    capture_output=True, text=True, timeout=300  # 5 min timeout for npm install
                 )
                 current_logger.info(f"'npm install' stdout:\n{npm_proc.stdout}")
                 if npm_proc.stderr:
@@ -178,6 +212,7 @@ def _run_stagehand_subprocess(
             current_logger.error(msg)
             return False, None, msg
 
+        # Execute the Stagehand handler script
         stagehand_temp_dl_dir = output_dirs['stagehand_temp_downloads']
         cmd = [
             "node", str(STAGEHAND_HANDLER_SCRIPT_PATH),
@@ -187,7 +222,7 @@ def _run_stagehand_subprocess(
         current_logger.info(f"Executing Stagehand command: {' '.join(cmd)}")
 
         process = subprocess.run(
-            cmd, cwd=str(STAGEHAND_DIR), check=False, # check=False to handle errors manually
+            cmd, cwd=str(STAGEHAND_DIR), check=False,  # check=False to handle errors manually
             capture_output=True, text=True, timeout=timeout_seconds
         )
 
@@ -205,13 +240,13 @@ def _run_stagehand_subprocess(
             downloaded_zips = glob.glob(zip_pattern)
 
             if not downloaded_zips:
-                 # Check if Stagehand reported a specific success path in stdout
+                # Check if Stagehand reported a specific success path in stdout
                 if "DOWNLOAD_SUCCESS_PATH:" in process.stdout:
                     try:
                         reported_path_str = process.stdout.split("DOWNLOAD_SUCCESS_PATH:")[1].splitlines()[0].strip()
                         reported_path = Path(reported_path_str)
                         if reported_path.exists() and reported_path.is_file() and reported_path.name.lower().endswith(".zip"):
-                            downloaded_zips = [str(reported_path)] # Use the path reported by Stagehand
+                            downloaded_zips = [str(reported_path)]  # Use the path reported by Stagehand
                             current_logger.info(f"Stagehand reported successful download: {reported_path_str}")
                         else:
                             current_logger.warning(f"Stagehand reported path {reported_path_str}, but it's not a valid zip file.")
@@ -257,47 +292,86 @@ def _run_stagehand_subprocess(
 # --- Main Handler Function ---
 def run_handler(
     company_id: str,
-    url: str,
     output_dir: str,
+    keywords: List[str] = None,
+    notion_database_id: str = None,
+    target_url: str = DEFAULT_TARGET_URL,
     timeout: int = 1800  # Default timeout 30 minutes
 ) -> Dict[str, Any]:
-    """Main entry point for the SANEAGO download handler."""
-    global logger # Allow reassignment of the global logger variable
+    """
+    Main entry point for the SANEAGO download handler.
+    
+    Args:
+        company_id: Identifier for the company (e.g., "SANEAGO")
+        output_dir: Directory to save logs, archives, and temporary files
+        keywords: List of keywords to filter results (not used by this handler; included for interface compatibility)
+        notion_database_id: Notion database ID (not used by this handler; included for interface compatibility)
+        target_url: URL to use for download (defaults to standard SANEAGO procurement page)
+        timeout: Timeout in seconds for the stagehand subprocess
+        
+    Returns:
+        Dictionary with standardized structure containing success, tenders processed, and any error message
+    """
+    global logger  # Allow reassignment of the global logger variable
     logger = setup_logging(output_dir, company_id, HANDLER_NAME)
     
-    logger.info(f"=== Starting SANEAGO Handler for Company ID: {company_id}, URL: {url} ===")
+    logger.info(f"=== Starting SANEAGO Handler for Company ID: {company_id}, URL: {target_url} ===")
+    if keywords:
+        logger.info(f"Keywords provided: {keywords} (Note: SANEAGO handler does not filter by keywords)")
     
-    final_file_path: Optional[str] = None
-    error_message: Optional[str] = None
-    success = False
-
+    # Initialize output structure
+    result = {
+        "success": False,
+        "company_id": company_id,
+        "new_tenders_processed": [],
+        "error_message": None
+    }
+    
     try:
+        # Set up output directories
         output_dirs = setup_output_dirs(output_dir, logger)
-        success, final_file_path, error_message = _run_stagehand_subprocess(
-            target_url=url,
+        
+        # Run the Stagehand subprocess to perform the download
+        success, final_zip_path, error_message = _run_stagehand_subprocess(
+            target_url=target_url,
             output_dirs=output_dirs,
             timeout_seconds=timeout,
             current_logger=logger
         )
+        
+        # Update result based on Stagehand execution
+        result["success"] = success
+        result["error_message"] = error_message
+        
+        # If successful, add the downloaded tender to the result
+        if success and final_zip_path:
+            zip_filename = os.path.basename(final_zip_path)
+            
+            # Extract tender_id and title from the downloaded file
+            tender_id, title = extract_tender_metadata(zip_filename, target_url)
+            
+            # Create tender entry that matches the required format
+            tender_entry = {
+                "tender_id": tender_id,
+                "title": title,
+                "downloaded_zip_path": final_zip_path,
+                "source_url": target_url
+            }
+            
+            result["new_tenders_processed"].append(tender_entry)
+            logger.info(f"Successfully processed tender: {tender_id} - {title}")
+            
     except Exception as e:
-        logger.exception(f"Critical error in run_handler before or during Stagehand execution: {e}")
-        success = False
-        error_message = f"Critical handler error: {e}"
-
-    result = {
-        "success": success,
-        "company_id": company_id,
-        "url": url,
-        "file_path": final_file_path,
-        "error_message": error_message,
-        "handler_name": HANDLER_NAME
-    }
-    
-    if success:
-        logger.info(f"SANEAGO Handler completed successfully for URL: {url}. Archive: {final_file_path}")
+        logger.exception(f"Critical error in run_handler: {e}")
+        result["success"] = False
+        result["error_message"] = f"Critical handler error: {e}"
+        
+    if result["success"]:
+        logger.info(f"SANEAGO Handler completed successfully. Processed {len(result['new_tenders_processed'])} tenders.")
     else:
-        logger.error(f"SANEAGO Handler failed for URL: {url}. Error: {error_message}")
-    logger.info(f"=== Finished SANEAGO Handler for Company ID: {company_id}, URL: {url} ===")
+        logger.error(f"SANEAGO Handler failed. Error: {result['error_message']}")
+    
+    logger.info(f"=== Finished SANEAGO Handler for Company ID: {company_id} ===")
     
     return result
 
@@ -305,9 +379,11 @@ def run_handler(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=f"{HANDLER_NAME} - Test CLI")
     parser.add_argument("--company-id", required=True, help="Company ID for logging and context.")
-    parser.add_argument("--url", required=True, help="Target URL for SANEAGO procurement page/document.")
-    parser.add_argument("--output-dir", required=True, help="Base directory for all outputs (logs, archives, temp). Example: ./downloads/saneago_run_1")
-    parser.add_argument("--timeout", type=int, default=1800, help="Timeout in seconds for the entire Stagehand process (default: 1800s / 30min).")
+    parser.add_argument("--url", default=DEFAULT_TARGET_URL, help=f"Target URL (default: {DEFAULT_TARGET_URL})")
+    parser.add_argument("--output-dir", required=True, help="Base directory for all outputs.")
+    parser.add_argument("--timeout", type=int, default=1800, help="Timeout in seconds (default: 1800s / 30min).")
+    parser.add_argument("--keywords", nargs="*", help="Keywords for filtering (not used by this handler)")
+    parser.add_argument("--notion-db-id", help="Notion Database ID (not used by this handler)")
     
     args = parser.parse_args()
     
@@ -318,8 +394,10 @@ if __name__ == "__main__":
 
     handler_result = run_handler(
         company_id=args.company_id,
-        url=args.url,
         output_dir=args.output_dir,
+        keywords=args.keywords,
+        notion_database_id=args.notion_db_id,
+        target_url=args.url,
         timeout=args.timeout
     )
     

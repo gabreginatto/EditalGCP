@@ -4,33 +4,22 @@ Compesa Download Handler for Procurement Download System
 
 Handles downloading documents from the Compesa procurement portal (portalscl.compesa.com.br).
 
-Workflow:
-1. Navigates to the main listing page 
-   (https://portalscl.compesa.com.br:8743/webrunstudio/form.jsp?sys=SCL&action=openform&formID=7&...).
-2. Filters processes based on keywords in the 'Objeto' column within the main iframe.
-3. Avoids reprocessing using a state file (processed_compesa.json).
-4. For matching processes, clicks the details trigger (three dots icon).
-5. Handles the multi-step popup sequence within its own iframe:
-    - Selects 'Pessoa Jurídica'.
-    - Selects the first 'Lote'.
-    - Enters a predefined CNPJ.
-    - Clicks 'Consultar'.
-    - Waits for 'Salvar'.
-    - Clicks 'Salvar' and handles the subsequent confirmation dialog.
-    - Waits for and clicks the 'DOWNLOAD DO EDITAL' button.
-6. Downloads the main document using Playwright's download event (primary)
-   or attempts URL extraction + requests (secondary, currently commented out).
-7. Creates a ZIP archive containing the downloaded document for each process.
+This handler is designed to work within the procurement document processing system:
+1. Navigates to the Compesa procurement portal
+2. Searches for items matching keywords
+3. Downloads documents for matching processes
+4. Creates ZIP archives of the downloaded documents
+5. Returns standardized information about the processed tenders
 
-Usage:
-    python dynamic_handler_compesa.py --url URL --output-dir DIR [--timeout SECONDS]
+Usage (within the framework):
+    result = run_handler(company_id="COMPESA_AVISO", output_dir="/path/to/output", 
+                        keywords=["tubo", "polietileno"], notion_database_id="db_id")
 """
 
 import os
 import sys
 import json
 import time
-import argparse
 import logging
 import re
 import traceback
@@ -41,7 +30,7 @@ import requests
 from pathlib import Path
 from urllib.parse import urlparse, unquote, urljoin
 from datetime import datetime
-from typing import Set, Dict, Optional, Tuple, List
+from typing import Set, Dict, Optional, Tuple, List, Any
 
 # Import Playwright components
 try:
@@ -58,46 +47,60 @@ try:
 except ImportError:
     print(json.dumps({
         "success": False,
+        "company_id": "COMPESA_AVISO",
+        "new_tenders_processed": [],
         "error_message": "Playwright not installed. Run 'pip install playwright' and 'playwright install'"
     }))
     sys.exit(1)
 
-# --- Logging Configuration ---
-script_dir = os.path.dirname(os.path.abspath(__file__))
-base_download_dir = os.path.abspath(os.path.join(script_dir, '..', '..', 'downloads'))
-log_dir = os.path.join(base_download_dir, "logs")
-os.makedirs(log_dir, exist_ok=True)
-log_file = f"dynamic_handler_compesa_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-log_path = os.path.join(log_dir, log_file)
-
-logging.basicConfig(
-    level=logging.INFO, # INFO for production, DEBUG for development
-    format='%(asctime)s - %(levelname)s - [%(name)s:%(lineno)d] - %(message)s',
-    handlers=[
-        logging.FileHandler(log_path, encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger("CompesaHandler")
-
 # --- Configuration ---
-KEYWORDS = ["tubo", "polietileno", "PEAD", "polimero", "PAM", "hidrômetro", "medidor"]
+DEFAULT_KEYWORDS = ["tubo", "polietileno", "PEAD", "polimero", "PAM", "hidrômetro", "medidor"]
 STATE_FILE_NAME = "processed_compesa.json"
 STATE_KEY = "processed_compesa_processos"
-BASE_URL = "https://portalscl.compesa.com.br:8743/" # Adjust if necessary
-CNPJ_TO_USE = "39.726.816/0001-32" # Predefined CNPJ
+BASE_URL = "https://portalscl.compesa.com.br:8743/"
+CNPJ_TO_USE = "39.726.816/0001-32"
 
 # --- Helper Functions ---
+def setup_logging(output_dir: str) -> logging.Logger:
+    """Set up logging configuration for the handler."""
+    log_dir = os.path.join(output_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    
+    log_file = f"dynamic_handler_compesa_aviso_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_path = os.path.join(log_dir, log_file)
+    
+    logger = logging.getLogger("CompesaHandler")
+    # Clear any existing handlers to avoid duplicates
+    if logger.handlers:
+        logger.handlers.clear()
+    
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(name)s:%(lineno)d] - %(message)s')
+    
+    # File handler
+    file_handler = logging.FileHandler(log_path, encoding='utf-8')
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(logging.DEBUG)
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(logging.INFO)
+    
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    logger.setLevel(logging.DEBUG)
+    
+    return logger
 
-def setup_output_dirs(base_dir):
-    """Ensure all necessary output directories exist relative to the base download dir."""
+def setup_output_dirs(base_dir: str, logger: logging.Logger) -> Dict[str, str]:
+    """Ensure all necessary output directories exist relative to the base output directory."""
     base_dir_abs = os.path.abspath(base_dir)
     logger.info(f"Setting up directories relative to: {base_dir_abs}")
     output_dirs = {
         'pdf': os.path.join(base_dir_abs, 'pdfs'),
         'archive': os.path.join(base_dir_abs, 'archives'),
         'debug': os.path.join(base_dir_abs, 'debug'),
-        'logs': log_dir,
+        'logs': os.path.join(base_dir_abs, 'logs'),
         'screenshots': os.path.join(base_dir_abs, 'debug', 'screenshots'),
         'temp': os.path.join(base_dir_abs, 'temp'),
         'state': base_dir_abs
@@ -106,6 +109,7 @@ def setup_output_dirs(base_dir):
         if key != 'state':
             try:
                 os.makedirs(dir_path, exist_ok=True)
+                logger.debug(f"Created directory: {dir_path}")
             except OSError as e:
                 logger.error(f"Failed to create directory {dir_path}: {e}")
                 raise
@@ -113,7 +117,8 @@ def setup_output_dirs(base_dir):
 
 def clean_filename(filename: Optional[str], max_length: int = 100) -> str:
     """Clean a filename to make it safe for the filesystem."""
-    if not filename: return f"unknown_file_{int(time.time())}"
+    if not filename: 
+        return f"unknown_file_{int(time.time())}"
     filename = os.path.basename(filename)
     filename = re.sub(r'[\\/*?:"<>|\n\r]', '_', filename)
     filename = re.sub(r'[\s_]+', '_', filename)
@@ -123,10 +128,11 @@ def clean_filename(filename: Optional[str], max_length: int = 100) -> str:
         ext = ext[:max_length]
         name = name[:max_length - len(ext)]
         filename = name + ext
-    if not filename: return f"cleaned_empty_{int(time.time())}"
+    if not filename: 
+        return f"cleaned_empty_{int(time.time())}"
     return filename
 
-def create_zip_archive(file_paths: list[str], output_zip_path: str) -> bool:
+def create_zip_archive(file_paths: List[str], output_zip_path: str, logger: logging.Logger) -> bool:
     """Create a ZIP archive containing multiple files."""
     if not file_paths:
         logger.warning(f"No files provided to create zip: {output_zip_path}")
@@ -145,11 +151,13 @@ def create_zip_archive(file_paths: list[str], output_zip_path: str) -> bool:
     except Exception as e:
         logger.error(f"Error creating ZIP archive {output_zip_path}: {e}", exc_info=True)
         if os.path.exists(output_zip_path):
-            try: os.remove(output_zip_path)
-            except Exception as rm_e: logger.error(f"Failed to remove partial zip {output_zip_path}: {rm_e}")
+            try: 
+                os.remove(output_zip_path)
+            except Exception as rm_e: 
+                logger.error(f"Failed to remove partial zip {output_zip_path}: {rm_e}")
         return False
 
-def load_processed_state(output_dirs: Dict[str, str]) -> Set[str]:
+def load_processed_state(output_dirs: Dict[str, str], logger: logging.Logger) -> Set[str]:
     """Load the set of processed process IDs from the state file."""
     state_file_path = os.path.join(output_dirs['state'], STATE_FILE_NAME)
     try:
@@ -166,7 +174,7 @@ def load_processed_state(output_dirs: Dict[str, str]) -> Set[str]:
         logger.error(f"Error loading state file {state_file_path}: {e}. Starting fresh.", exc_info=True)
         return set()
 
-def save_processed_state(output_dirs: Dict[str, str], processed_set: Set[str]):
+def save_processed_state(output_dirs: Dict[str, str], processed_set: Set[str], logger: logging.Logger):
     """Save the set of processed process IDs to the state file."""
     state_file_path = os.path.join(output_dirs['state'], STATE_FILE_NAME)
     try:
@@ -178,20 +186,13 @@ def save_processed_state(output_dirs: Dict[str, str], processed_set: Set[str]):
     except (IOError, TypeError, Exception) as e:
         logger.error(f"Error saving state file {state_file_path}: {e}", exc_info=True)
 
-async def handle_dialog(dialog: Dialog):
+async def handle_dialog(dialog: Dialog, logger: logging.Logger):
     """Handles confirmation dialogs by accepting them."""
     logger.info(f"Dialog message detected: '{dialog.message}'. Accepting.")
     await dialog.accept()
 
 async def simulate_human_typing(page_or_frame, input_element, text, delay_range=(50, 150)):
-    """Simulates human typing by typing characters one by one with random delays.
-    
-    Args:
-        page_or_frame: Playwright page or frame to type in
-        input_element: Locator for the input element
-        text: The text to type
-        delay_range: Tuple of (min_ms, max_ms) for random delay between keystrokes
-    """
+    """Simulates human typing by typing characters one by one with random delays."""
     import random
     
     # Clear the input field first
@@ -208,20 +209,27 @@ async def process_detail_popup(
     context: BrowserContext,
     processo_id: str,
     objeto_clean: str,
-    output_dirs: Dict[str, str]
-) -> bool:
-    """Handles the multi-step popup to download the edital document."""
+    output_dirs: Dict[str, str],
+    logger: logging.Logger
+) -> Tuple[bool, Optional[str]]:
+    """
+    Handles the multi-step popup to download the edital document.
+    
+    Returns:
+        Tuple of (success: bool, zip_filepath: Optional[str])
+    """
     logger.info(f"--- Processing Detail Popup for Process: {processo_id} ---")
     temp_process_dir = os.path.join(output_dirs['temp'], processo_id)
     os.makedirs(temp_process_dir, exist_ok=True)
     downloaded_file_path = None
     final_zip_success = False
+    final_zip_path = None
 
     try:
-        # Take an initial screenshot to see what we're working with
+        # Take an initial screenshot
         await popup_page.screenshot(path=os.path.join(output_dirs['screenshots'], f"popup_{processo_id}_1_initial.png"))
         
-        # Examine the structure of the popup to determine the correct approach
+        # Examine the popup structure
         frame_info = await popup_page.evaluate("""() => {
             try {
                 // Check for iframe presence
@@ -256,12 +264,11 @@ async def process_detail_popup(
         if 'error' in frame_info:
             logger.warning(f"Error inspecting popup structure: {frame_info['error']}")
         
-        # Check if we have an iframe to work with
+        # Find target frame (mainform or first child)
         target_frame = None
         if frame_info.get('iframeCount', 0) > 0:
             logger.info(f"Found {frame_info['iframeCount']} iframes in popup.")
             
-            # Try to find the mainform iframe first
             frames = popup_page.frames
             for frame in frames:
                 try:
@@ -273,16 +280,15 @@ async def process_detail_popup(
                 except Exception as frame_err:
                     logger.warning(f"Error getting frame name: {frame_err}")
             
-            # If mainform not found, try the first iframe
             if not target_frame and len(frames) > 1:
                 logger.info("Using first child iframe as target")
                 target_frame = frames[1]  # Skip main frame (index 0)
         
-        # If we have a target frame, use it; otherwise try to interact directly with the page
+        # Work with the target frame if found
         if target_frame:
             logger.info("Using target iframe for interactions")
             
-            # --- Step 1: Look for pessoa jurídica radio button in the frame ---
+            # --- Step 1: Look for pessoa jurídica radio button ---
             radio_visible = await target_frame.evaluate("""() => {
                 try {
                     // First try specific value
@@ -360,18 +366,18 @@ async def process_detail_popup(
             
             logger.info(f"Radio button selection result: {radio_visible}")
             
-            # --- Step 2: Look for lote dropdown using robust Playwright selectors ---
+            # --- Step 2: Look for lote dropdown using robust selectors ---
             try:
-                # More robust way to click the LOTE dropdown
+                # Try to click the LOTE dropdown
                 await target_frame.click('button:near(:text("LOTE"))', timeout=5000)
                 logger.info("Successfully clicked LOTE dropdown using robust selector")
                 
-                # Wait a moment for dropdown to open
+                # Wait for dropdown to open
                 await target_frame.wait_for_timeout(1000)
                 
-                # Try to click the first option in the dropdown using various selectors
+                # Try to click the first option in the dropdown
                 try:
-                    # Try JavaScript approach to select first option immediately since Playwright selections aren't working
+                    # JavaScript approach to select first option
                     selected_option = await target_frame.evaluate("""() => {
                         try {
                             // Find all select elements
@@ -428,25 +434,20 @@ async def process_detail_popup(
                     
                     if selected_option.get('success', False):
                         logger.info(f"Selected and clicked first option via JavaScript: {selected_option.get('optionText', 'Unknown')}")
-                        # Wait a moment for click to take effect
                         await target_frame.wait_for_timeout(500)
                     else:
-                        # If JavaScript selection fails, try direct click with force option
+                        # Alternative approaches if JavaScript selection fails
                         try:
-                            # Try to forcibly click the option directly
                             option = await target_frame.query_selector('select option:nth-child(2)')
                             if option:
                                 await option.click(force=True, timeout=2000)
                                 logger.info("Force-clicked first option using select option selector")
                             else:
-                                # Last resort - click by JS
                                 await target_frame.evaluate("""() => {
-                                    // Try to click the first visible option in all selects
                                     const selects = document.querySelectorAll('select');
                                     for (const select of selects) {
                                         if (select.options.length > 1) {
-                                            // Try to click the option directly
-                                            const option = select.options[1]; // Use second option (index 1)
+                                            const option = select.options[1];
                                             option.click();
                                             return true;
                                         }
@@ -456,13 +457,11 @@ async def process_detail_popup(
                                 logger.info("Clicked first option via direct JavaScript click")
                         except Exception as click_err:
                             logger.warning(f"Error clicking option: {click_err}")
-                            # Final fallback - use dispatchEvent
+                            # Final fallback
                             await target_frame.evaluate("""() => {
                                 const select = document.querySelector('select');
                                 if (select && select.options.length > 1) {
-                                    // First select the option
                                     select.selectedIndex = 1;
-                                    // Create and dispatch click events on the option
                                     const option = select.options[1];
                                     const evt = new MouseEvent('click', {
                                         bubbles: true,
@@ -470,26 +469,18 @@ async def process_detail_popup(
                                         view: window
                                     });
                                     option.dispatchEvent(evt);
-                                    // Also trigger change event on select
                                     select.dispatchEvent(new Event('change', {bubbles: true}));
                                 }
                             }""")
                             logger.info("Force-triggered click event on option as last resort")
-                    
-                    lote_result = {'success': True, 'message': 'Selected first option in dropdown'}
                 except Exception as e:
                     logger.warning(f"All attempts to select dropdown option failed: {e}")
-                    # Continue with the fallback JavaScript approach outside this block
                     raise PlaywrightTimeoutError(f"Could not select dropdown option: {e}")
-                
-                lote_result = {'success': True, 'message': 'Selected LOTE option using Playwright selectors'}
             except PlaywrightTimeoutError as e:
                 logger.warning(f"Could not find or click LOTE dropdown using robust selectors: {e}")
-                # Fallback to the existing JavaScript approach
+                # Fallback to JavaScript approach
                 lote_result = await target_frame.evaluate("""() => {
                     try {
-                        // Try multiple approaches to find the Lote dropdown with TUBO options
-                        
                         // Helper function to check visibility
                         function isElementVisible(el) {
                             if (!el) return false;
@@ -500,7 +491,7 @@ async def process_detail_popup(
                                   el.offsetParent !== null;
                         }
                         
-                        // 1. Search specifically for select with TUBO options
+                        // Search for select with TUBO options
                         const allSelects = document.querySelectorAll('select');
                         let loteSelect = null;
                         let tuboOptionsFound = false;
@@ -528,7 +519,7 @@ async def process_detail_popup(
                             }
                         }
                         
-                        // 2. If not found above, look for the HTMLLookupDetails element from the screenshot
+                        // If not found, look for HTMLLookupDetails
                         if (!tuboOptionsFound) {
                             const lookupDetails = document.querySelectorAll('.HTMLLookupDetails, div[class*="Lookup"]');
                             for (const lookup of lookupDetails) {
@@ -542,7 +533,7 @@ async def process_detail_popup(
                             }
                         }
                         
-                        // 3. Look for a dropdown inside lookupInput container
+                        // Look for dropdown inside lookupInput container
                         if (!loteSelect) {
                             const lookupInput = document.getElementById('lookupInput');
                             if (lookupInput) {
@@ -631,14 +622,14 @@ async def process_detail_popup(
                             }
                         }
                         
-                        // Extra debugging - try to get the innerHTML of possible lookup containers
+                        // Debugging information if we can't find the dropdown
                         let lookupDetailsHTML = '';
                         const possibleLookupContainer = document.querySelector('.HTMLLookupDetails, div[class*="Lookup"]');
                         if (possibleLookupContainer) {
-                            lookupDetailsHTML = possibleLookupContainer.innerHTML.substring(0, 500) + '...'; // Truncate to avoid excessive output
+                            lookupDetailsHTML = possibleLookupContainer.innerHTML.substring(0, 500) + '...';
                         }
                         
-                        // Diagnostic information if we can't find the dropdown
+                        // More diagnostic information
                         const allSelectsInfo = Array.from(allSelects).map(select => ({
                             id: select.id || 'no-id',
                             name: select.name || 'no-name',
@@ -659,11 +650,11 @@ async def process_detail_popup(
                         return { error: e.toString() };
                     }
                 }""")
-            
-            logger.info(f"Lote selection result: {lote_result}")
+                
+                logger.info(f"Lote selection result: {lote_result}")
             
             # --- Step 3: Enter CNPJ ---
-            # First find all visible text inputs to identify the CNPJ field
+            # Find all visible text inputs to identify the CNPJ field
             visible_inputs = await target_frame.evaluate("""() => {
                 try {
                     // Get all input elements that are visible
@@ -730,7 +721,7 @@ async def process_detail_popup(
                     cnpj_result = {'success': True, 'message': 'CNPJ typed manually character by character'}
                 except Exception as typing_err:
                     logger.error(f"Error typing CNPJ: {typing_err}")
-                    # Fallback to the original JavaScript approach
+                    # Fallback to JavaScript approach
                     cnpj_result = await target_frame.evaluate("""(cnpj) => {
                         try {
                             // Try multiple approaches to find the CNPJ input - but only visible ones
@@ -807,7 +798,7 @@ async def process_detail_popup(
             await popup_page.wait_for_timeout(5000)  # Give time for SALVAR to appear
             
             # Set up dialog handler
-            popup_page.once('dialog', handle_dialog)
+            popup_page.once('dialog', lambda dialog: handle_dialog(dialog, logger))
             
             salvar_result = await target_frame.evaluate("""() => {
                 try {
@@ -844,7 +835,7 @@ async def process_detail_popup(
             # Wait longer after SALVAR to ensure UI updates
             await popup_page.wait_for_timeout(8000)  # Extended from 5000ms to 8000ms
             
-            # Take another screenshot to see the state before attempting to find the download button
+            # Take another screenshot before searching for download button
             await popup_page.screenshot(path=os.path.join(output_dirs['screenshots'], f"popup_{processo_id}_4_before_download.png"))
             
             # Use a more aggressive approach to check for download buttons or links
@@ -852,6 +843,16 @@ async def process_detail_popup(
                 try {
                     // Scroll down to reveal potential hidden elements
                     window.scrollTo(0, document.body.scrollHeight);
+                    
+                    // Helper function to check visibility
+                    function isElementVisible(el) {
+                        if (!el) return false;
+                        const style = window.getComputedStyle(el);
+                        return style.display !== 'none' && 
+                               style.visibility !== 'hidden' && 
+                               style.opacity !== '0' &&
+                               el.offsetParent !== null;
+                    }
                     
                     // Try multiple potential selectors for download elements
                     const downloadElements = [];
@@ -888,16 +889,6 @@ async def process_detail_popup(
                         visible: isElementVisible(el),
                         index: Array.from(document.querySelectorAll(el.tagName)).indexOf(el)
                     })));
-                    
-                    // Helper function to check visibility
-                    function isElementVisible(el) {
-                        if (!el) return false;
-                        const style = window.getComputedStyle(el);
-                        return style.display !== 'none' && 
-                               style.visibility !== 'hidden' && 
-                               style.opacity !== '0' &&
-                               el.offsetParent !== null;
-                    }
                     
                     // Attempt to make buttons visible if they're not
                     downloadButtons.forEach(btn => {
@@ -1151,8 +1142,9 @@ async def process_detail_popup(
         if downloaded_file_path and os.path.exists(downloaded_file_path):
             zip_filename = clean_filename(f"{processo_id}_{objeto_clean}.zip", max_length=150)
             zip_filepath = os.path.join(output_dirs['archive'], zip_filename)
-            if create_zip_archive([downloaded_file_path], zip_filepath):
+            if create_zip_archive([downloaded_file_path], zip_filepath, logger):
                 final_zip_success = True
+                final_zip_path = zip_filepath
                 logger.info(f"Created ZIP archive: {zip_filepath}")
             else:
                 logger.error(f"Failed to create final ZIP for {processo_id}")
@@ -1163,7 +1155,8 @@ async def process_detail_popup(
         logger.error(f"Critical error processing detail popup for {processo_id}: {e}", exc_info=True)
         try:
              await popup_page.screenshot(path=os.path.join(output_dirs['screenshots'], f"popup_{processo_id}_9_critical_error.png"))
-        except Exception: pass # Ignore screenshot error during critical failure
+        except Exception: 
+            pass # Ignore screenshot error during critical failure
         final_zip_success = False
     finally:
         # Clean up temp directory for this process
@@ -1175,11 +1168,18 @@ async def process_detail_popup(
             logger.error(f"Error cleaning temp dir {temp_process_dir}: {cleanup_e}")
 
     logger.info(f"--- Finished Processing Detail Popup for Process: {processo_id} | Success: {final_zip_success} ---")
-    return final_zip_success
+    return final_zip_success, final_zip_path
 
-async def process_search_page(page: Page, context: BrowserContext, search_url: str, output_dirs: Dict[str, str], processed_state: Set[str]) -> Set[str]:
-    """Processes the main listing page using accessibility APIs, filters by keywords, and triggers detail popup processing."""
+async def process_search_page(page: Page, context: BrowserContext, search_url: str, output_dirs: Dict[str, str], processed_state: Set[str], keywords: List[str], logger: logging.Logger) -> Tuple[Set[str], List[Dict[str, Any]]]:
+    """
+    Processes the main listing page, filters by keywords, and triggers detail popup processing.
+    
+    Returns:
+        Tuple of (newly_processed_ids: Set[str], processed_tenders: List[Dict[str, Any]])
+    """
     newly_processed_in_this_run = set()
+    processed_tenders = []
+    
     try:
         logger.info(f"Navigating to Compesa search page: {search_url}")
         await page.goto(search_url, wait_until="networkidle", timeout=90000)
@@ -1191,18 +1191,18 @@ async def process_search_page(page: Page, context: BrowserContext, search_url: s
         frame_handle = await page.wait_for_selector('iframe', timeout=30000)
         if not frame_handle:
             logger.error("Could not find iframe. Aborting.")
-            return newly_processed_in_this_run
+            return newly_processed_in_this_run, processed_tenders
             
         frame = await frame_handle.content_frame()
         if not frame:
             logger.error("Could not access iframe content. Aborting.")
             await page.screenshot(path=os.path.join(output_dirs['screenshots'], f"search_page_iframe_error.png"))
-            return newly_processed_in_this_run
+            return newly_processed_in_this_run, processed_tenders
             
         logger.info("Located iframe. Waiting for content to load...")
         await page.wait_for_timeout(5000)  # Give time for iframe content to load
 
-        # --- Use accessibility approach to find all list items (not just the first one) ---
+        # --- Use accessibility approach to find all list items ---
         list_items_info = await frame.evaluate("""() => {
             try {
                 // Find all list items
@@ -1255,9 +1255,9 @@ async def process_search_page(page: Page, context: BrowserContext, search_url: s
                     logger.debug(f"Could not extract process ID from list item {item['index']}")
                     continue
                 
-                # Check for any of the handler's KEYWORDS (not just "BORBOLETAS")
+                # Check for any of the handler's keywords
                 item_text_upper = item_text.upper()
-                matching_keywords = [keyword for keyword in KEYWORDS if keyword.upper() in item_text_upper]
+                matching_keywords = [keyword for keyword in keywords if keyword.upper() in item_text_upper]
                 
                 if matching_keywords:
                     # Clean up the object text to use as filename
@@ -1278,7 +1278,9 @@ async def process_search_page(page: Page, context: BrowserContext, search_url: s
                         "list_item_index": item['index'],
                         "processo_id": processo_id,
                         "objeto_clean": objeto_clean,
-                        "matching_keywords": matching_keywords
+                        "objeto_full": item_text,
+                        "matching_keywords": matching_keywords,
+                        "source_url": search_url
                     })
             
             # --- Process all the identified rows ---
@@ -1286,7 +1288,9 @@ async def process_search_page(page: Page, context: BrowserContext, search_url: s
             for data in rows_to_process:
                 processo_id = data['processo_id']
                 objeto_clean = data['objeto_clean']
+                objeto_full = data['objeto_full']
                 item_index = data['list_item_index']
+                source_url = data['source_url']
                 popup_page = None
                 
                 try:
@@ -1329,13 +1333,21 @@ async def process_search_page(page: Page, context: BrowserContext, search_url: s
                     await popup_page.wait_for_load_state("domcontentloaded", timeout=60000)
                     
                     # Process the popup with your existing function
-                    success = await process_detail_popup(
-                        popup_page, context, processo_id, objeto_clean, output_dirs
+                    success, zip_path = await process_detail_popup(
+                        popup_page, context, processo_id, objeto_clean, output_dirs, logger
                     )
                     
-                    if success:
+                    if success and zip_path:
                         logger.info(f"Successfully processed popup and downloaded for {processo_id}")
                         newly_processed_in_this_run.add(processo_id)
+                        
+                        # Collect tender information
+                        processed_tenders.append({
+                            "tender_id": processo_id,
+                            "title": objeto_full[:200],  # Limit to 200 chars for title
+                            "downloaded_zip_path": zip_path,
+                            "source_url": source_url
+                        })
                     else:
                         logger.warning(f"Failed processing popup for {processo_id}")
                         
@@ -1363,17 +1375,6 @@ async def process_search_page(page: Page, context: BrowserContext, search_url: s
             logger.warning("No list items found using direct evaluation.")
             # Take a screenshot to help diagnose the issue
             await page.screenshot(path=os.path.join(output_dirs['screenshots'], f"no_list_items_found.png"))
-            
-            # Try to get more diagnostic information about what's in the frame
-            frame_content = await frame.evaluate("""() => {
-                return {
-                    bodyContent: document.body ? document.body.innerHTML.substring(0, 1000) : 'No body element',
-                    elementCount: document.querySelectorAll('*').length,
-                    roles: Array.from(document.querySelectorAll('[role]')).map(el => el.getAttribute('role'))
-                };
-            }""")
-            
-            logger.debug(f"Frame content diagnostic: {frame_content}")
     
     except PlaywrightTimeoutError as pte:
         logger.error(f"Timeout error on search page {search_url}: {pte}")
@@ -1388,86 +1389,171 @@ async def process_search_page(page: Page, context: BrowserContext, search_url: s
         except Exception:
             pass
     
-    return newly_processed_in_this_run
+    return newly_processed_in_this_run, processed_tenders
 
-async def handle_compesa_download(url, output_dir, timeout=300):
-    """Main handler function for Compesa downloads."""
-    playwright = None; browser = None; context = None
-    overall_success = False; processed_new_items_count = 0; error_message = None
+async def _async_run_handler(company_id: str, output_dir: str, keywords: List[str], logger: logging.Logger) -> Dict[str, Any]:
+    """
+    Internal async function to handle the Playwright workflow.
+    
+    Returns:
+        Dict with standardized result format
+    """
+    playwright = None
+    browser = None
+    context = None
+    processed_tenders = []
+    error_message = None
+    success = False
+    
     try:
-        output_dirs = setup_output_dirs(output_dir)
-        processed_state = load_processed_state(output_dirs)
+        # Setup output directories
+        output_dirs = setup_output_dirs(output_dir, logger)
+        
+        # Load previously processed IDs
+        processed_state = load_processed_state(output_dirs, logger)
 
+        # Initialize Playwright
         playwright = await async_playwright().start()
-        headless = False # Start non-headless for easier debugging
+        headless = True  # Set to True in production
         logger.info(f"Starting browser with headless={headless}")
+        
         browser = await playwright.chromium.launch(
             headless=headless,
             args=["--disable-web-security", "--disable-blink-features=AutomationControlled"]
         )
+        
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             viewport={"width": 1366, "height": 768},
             ignore_https_errors=True,
         )
-        context.set_default_timeout(45000) # Default action timeout
-        context.set_default_navigation_timeout(90000) # Navigation timeout
+        
+        context.set_default_timeout(45000)  # Default action timeout
+        context.set_default_navigation_timeout(90000)  # Navigation timeout
 
         page = await context.new_page()
 
-        # Process the main search/listing page
-        newly_processed = await process_search_page(page, context, url, output_dirs, processed_state)
-
-        processed_new_items_count = len(newly_processed)
+        # Process the main search page
+        search_url = "https://portalscl.compesa.com.br:8743/webrunstudio/form.jsp?sys=SCL&action=openform&formID=7&align=0&mode=-1&goto=-1&filter=&scrolling=yes"
+        newly_processed, tenders_data = await process_search_page(
+            page, context, search_url, output_dirs, processed_state, keywords, logger
+        )
+        
+        # Update processed items state if we found anything new
         if newly_processed:
             updated_state = processed_state.union(newly_processed)
-            save_processed_state(output_dirs, updated_state)
-            overall_success = True
+            save_processed_state(output_dirs, updated_state, logger)
+            logger.info(f"Successfully processed {len(newly_processed)} new tender(s).")
+            success = True
+            processed_tenders = tenders_data
         else:
-            logger.info(f"No new processes matching keywords found or processed on {url} in this run.")
-            overall_success = True # Considered success as the script ran, just no new data
-
+            logger.info(f"No new processes matching keywords found or processed in this run.")
+            success = True  # Still a successful run, just nothing new found
+        
     except Exception as e:
-        logger.critical(f"Critical error in handle_compesa_download for {url}: {e}", exc_info=True)
-        overall_success = False
+        logger.critical(f"Critical error in handler: {e}", exc_info=True)
         error_message = f"Critical error: {e}"
+        success = False
     finally:
+        # Clean up Playwright resources
         if context:
-            try: await context.close()
-            except Exception as e: logger.error(f"Error closing browser context: {e}")
+            try: 
+                await context.close()
+            except Exception as e: 
+                logger.error(f"Error closing browser context: {e}")
         if browser:
-            try: await browser.close()
-            except Exception as e: logger.error(f"Error closing browser: {e}")
+            try: 
+                await browser.close()
+            except Exception as e: 
+                logger.error(f"Error closing browser: {e}")
         if playwright:
-            try: await playwright.stop()
-            except Exception as e: logger.error(f"Error stopping Playwright: {e}")
+            try: 
+                await playwright.stop()
+            except Exception as e: 
+                logger.error(f"Error stopping Playwright: {e}")
         logger.info("Playwright resources cleaned up.")
 
-    # Result for the orchestrator
+    # Return standardized result structure
     result = {
-        "success": overall_success,
-        "url": url,
-        "file_path": None, # Output is ZIPs, not a single file
-        "error_message": error_message,
-        "processed_new_items_count": processed_new_items_count
+        "success": success,
+        "company_id": company_id,
+        "new_tenders_processed": processed_tenders,
+        "error_message": error_message
     }
-    print(json.dumps(result))
-    return 0 if overall_success else 1
+    
+    return result
 
-async def main():
-    """Parses arguments and runs the handler."""
-    parser = argparse.ArgumentParser(description="Compesa Download Handler")
-    parser.add_argument("--url", required=True, help="URL of the Compesa listing page (e.g., ...formID=7...)")
-    parser.add_argument("--output-dir", default=base_download_dir, help=f"Base output directory (defaults to: {base_download_dir})")
-    parser.add_argument("--timeout", type=int, default=600, help="Overall timeout for the handler in seconds (approximate)")
-    args = parser.parse_args()
-    output_dir_abs = os.path.abspath(args.output_dir)
-    exit_code = await handle_compesa_download(args.url, output_dir_abs, args.timeout)
-    sys.exit(exit_code)
-
-if __name__ == "__main__":
-    if sys.version_info >= (3, 7):
-        asyncio.run(main())
+def run_handler(company_id: str, output_dir: str, keywords: List[str] = None, notion_database_id: str = None) -> Dict[str, Any]:
+    """
+    Main entry point for the Compesa download handler.
+    
+    Args:
+        company_id: Identifier for the company (e.g., "COMPESA_AVISO")
+        output_dir: Base directory for all outputs (logs, archives, temp files)
+        keywords: List of keywords to search for in procurement documents
+        notion_database_id: Optional Notion database ID (not used in this handler)
+        
+    Returns:
+        Dict with standardized result format:
+        {
+            "success": true/false,
+            "company_id": "COMPANY_ID",
+            "new_tenders_processed": [
+                {
+                    "tender_id": "ID-123",
+                    "title": "Procurement Title", 
+                    "downloaded_zip_path": "path/to/archive.zip",
+                    "source_url": "https://company.com/tender/123"
+                }
+            ],
+            "error_message": null
+        }
+    """
+    # Set up logging
+    logger = setup_logging(output_dir)
+    logger.info(f"Starting run_handler for company_id={company_id}, output_dir={output_dir}")
+    
+    # Use default keywords if none provided
+    if not keywords:
+        keywords = DEFAULT_KEYWORDS
+        logger.info(f"No keywords provided, using defaults: {keywords}")
     else:
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(main())
+        logger.info(f"Using provided keywords: {keywords}")
+    
+    # Run the async function using asyncio.run
+    try:
+        result = asyncio.run(_async_run_handler(company_id, output_dir, keywords, logger))
+        logger.info(f"Handler completed with success={result['success']}, tenders processed={len(result['new_tenders_processed'])}")
+        return result
+    except Exception as e:
+        logger.critical(f"Fatal error in run_handler: {e}", exc_info=True)
+        return {
+            "success": False,
+            "company_id": company_id,
+            "new_tenders_processed": [],
+            "error_message": f"Fatal error in run_handler: {e}"
+        }
+
+# For CLI testing (backward compatibility)
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Compesa Download Handler")
+    parser.add_argument("--company-id", default="COMPESA_AVISO", help="Company ID")
+    parser.add_argument("--output-dir", required=True, help="Base output directory")
+    parser.add_argument("--keywords", nargs="+", default=DEFAULT_KEYWORDS, help="List of keywords to search for")
+    parser.add_argument("--notion-database-id", help="Optional Notion database ID")
+    
+    args = parser.parse_args()
+    
+    result = run_handler(
+        company_id=args.company_id,
+        output_dir=args.output_dir,
+        keywords=args.keywords,
+        notion_database_id=args.notion_database_id
+    )
+    
+    # Print JSON result for CLI use
+    print(json.dumps(result, indent=2))
+    
+    sys.exit(0 if result["success"] else 1)
